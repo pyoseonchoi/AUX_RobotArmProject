@@ -10,3 +10,5 @@ build
 *.so
 temp
 .pytest_cache/
+.venv/
+venv/
