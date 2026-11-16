@@ -90,10 +90,26 @@ def connect_nero(channel="0"):
     return robot, version, profile
 
 
+def read_flange_pose(robot, *, newer_than=None):
+    """Read all six flange coordinates only when every CAN component is fresh."""
+    feedback = robot.get_flange_pose()
+    required = [("플랜지 통합값", feedback)]
+    parser = getattr(robot, "_parser", None)
+    if parser is not None:
+        required.extend((name, getattr(parser, attr, None)) for name, attr in (
+            ("플랜지 X/Y", "end_pose_xy"), ("플랜지 Z/roll", "end_pose_zrx"),
+            ("플랜지 pitch/yaw", "end_pose_ryrz"),
+        ))
+    require_feedback(required, newer_than=newer_than)
+    pose = list(feedback.msg)
+    if len(pose) != 6 or not all(math.isfinite(value) for value in pose):
+        raise RuntimeError("플랜지 위치/자세 6개 값을 확인하지 못했습니다.")
+    return pose, feedback.timestamp
+
+
 def print_status(robot):
     joint = robot.get_joint_angles()
     status = robot.get_arm_status()
-    pose = robot.get_flange_pose()
     if joint is None:
         print("관절 피드백: 아직 수신되지 않았습니다.")
     else:
@@ -115,8 +131,15 @@ def print_status(robot):
         print("상태 피드백: 아직 수신되지 않았습니다.")
     else:
         print(status.msg)
-    if pose is not None:
-        print("플랜지 위치/자세 (m, rad):", [round(v, 6) for v in pose.msg])
+    try:
+        pose, _ = read_flange_pose(robot)
+    except RuntimeError as exc:
+        print("현재 XYZ 확인 불가:", exc)
+    else:
+        print("현재 XYZ (mm, 베이스 기준 / 플랜지): X={:.3f}, Y={:.3f}, Z={:.3f}".format(
+            *[v * 1000 for v in pose[:3]]))
+        print("현재 방향 RPY (deg):", [round(math.degrees(v), 3) for v in pose[3:]])
+        print("플랜지 위치/자세 (m, rad):", [round(v, 6) for v in pose])
 
 
 def main():
