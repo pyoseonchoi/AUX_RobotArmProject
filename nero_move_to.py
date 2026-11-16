@@ -4,11 +4,12 @@ import argparse
 import math
 import time
 
-from nero_move_linear import FeedbackUnavailableError, flange_pose, move_linear_target
-from nero_read_status import connect_nero, feedback_time
+from nero_diagnostics import SessionDiagnostics
+from nero_move_linear import flange_pose, move_linear_target
+from nero_read_status import FeedbackUnavailableError, connect_nero, feedback_time
 
 
-def make_target(start, xyz_mm, max_distance_mm=20.0):
+def make_target(start, xyz_mm, max_distance_mm=50.0):
     """Omitted coordinates retain the displayed position; angles stay unchanged."""
     if len(start) != 6 or not all(math.isfinite(value) for value in start):
         raise ValueError("현재 위치/방향 6개 값이 필요합니다.")
@@ -76,11 +77,16 @@ def main():
     parser.add_argument("--y", type=float, help="베이스 기준 절대 Y좌표(mm)")
     parser.add_argument("--z", type=float, help="베이스 기준 절대 Z좌표(mm)")
     parser.add_argument("--preview", action="store_true", help="좌표 조회/목표 계산만 하고 이동 명령은 보내지 않음")
-    parser.add_argument("--max-distance-mm", type=float, default=20.0,
-                        help="실수 방지용 직선 이동 거리 한도(mm), 기본 20. 도달 가능성 검사는 아님")
+    parser.add_argument("--timeout", type=float, default=30.0,
+                        help="이동 완료 대기 시간(초), 기본 30. 시간 초과 시 중단")
+    parser.add_argument("--max-distance-mm", type=float, default=50.0,
+                        help="실수 방지용 직선 이동 거리 한도(mm), 기본 50. 도달 가능성 검사는 아님")
     args = parser.parse_args()
     robot = None
+    diagnostics = None
     try:
+        if not math.isfinite(args.timeout) or args.timeout <= 0:
+            raise ValueError("timeout은 0보다 큰 유한한 초 값이어야 합니다.")
         if not math.isfinite(args.max_distance_mm) or args.max_distance_mm <= 0:
             raise ValueError("최대 이동 거리는 0보다 큰 유한한 mm 값이어야 합니다.")
         if not all(value is None or math.isfinite(value) for value in (args.x, args.y, args.z)):
@@ -90,14 +96,20 @@ def main():
             print("미리보기: 상태 조회와 목표 계산만 실행합니다.")
         else:
             print("실제 직선 이동을 실행합니다. 팔과 도구가 움직일 공간을 비우세요.")
-        robot, _, _ = connect_nero(args.channel)
+        diagnostics = SessionDiagnostics()
+        print("실행 진단 로그:", diagnostics.path.resolve())
+        diagnostics.event(None, "start", command="move_to", options=vars(args))
+        robot, version, profile = connect_nero(args.channel)
+        robot._nero_diagnostics = diagnostics
         time.sleep(1.0)
+        diagnostics.event(robot, "connected", firmware=version, sdk_profile=str(profile))
         start, _ = wait_for_flange_pose(robot)
         print("현재 XYZ(mm):", [round(value * 1000, 3) for value in start[:3]])
         print("현재 방향(deg):", [round(math.degrees(value), 3) for value in start[3:]])
         coordinates = [args.x, args.y, args.z]
         if all(value is None for value in coordinates):
             if args.preview:
+                diagnostics.event(robot, "preview_completed")
                 return 0
             # Console entry may take arbitrarily long. Do not retain a live
             # receive session or trust its cached pose across user input.
@@ -109,11 +121,13 @@ def main():
         print("목표 XYZ(mm):", [round(value * 1000, 3) for value in target[:3]])
         print(f"입력 시작 위치와 목표 사이 직선 거리: {distance_mm:.3f}mm")
         if args.preview:
+            diagnostics.event(robot, "preview_completed", target_m_rad=target, distance_mm=distance_mm)
             print("미리보기 완료. 이동 명령은 보내지 않았습니다. 도달 가능성/충돌 검사는 수행하지 않습니다.")
             return 0
         if robot is None:
             print("입력이 끝났습니다. 다시 연결해 최신 위치/상태를 확인합니다.")
             robot, _, _ = connect_nero(args.channel)
+            robot._nero_diagnostics = diagnostics
             time.sleep(1.0)
         # Require a newly received frame, not just the pre-input snapshot.
         # Preserve the orientation measured just before moving, and recheck
@@ -121,16 +135,26 @@ def main():
         current, _ = wait_for_flange_pose(robot, newer_than=feedback_time())
         target, distance_mm = make_target(current, [value * 1000 for value in target[:3]], args.max_distance_mm)
         if distance_mm < 0.5:
+            diagnostics.event(robot, "already_at_target", target_m_rad=target)
             print("현재 위치가 목표에서 0.5mm 미만입니다. 이동 명령을 보내지 않습니다.")
             return 0
-        move_linear_target(robot, target)
+        diagnostics.event(robot, "target_prepared", target_m_rad=target,
+                          distance_mm=distance_mm, timeout_s=args.timeout)
+        move_linear_target(robot, target, timeout=args.timeout)
+        diagnostics.event(robot, "completed")
         return 0
     except (Exception, KeyboardInterrupt) as exc:
+        if diagnostics is not None:
+            diagnostics.event(robot, "failed", error=str(exc) or "사용자 중단")
         print("좌표 이동 중단:", str(exc) or "사용자 중단")
         return 1
     finally:
-        if robot is not None:
-            robot.disconnect()
+        try:
+            if robot is not None:
+                robot.disconnect()
+        finally:
+            if diagnostics is not None:
+                diagnostics.close()
 
 
 if __name__ == "__main__":

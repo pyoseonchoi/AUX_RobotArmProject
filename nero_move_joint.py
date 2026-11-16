@@ -5,7 +5,19 @@ import math
 import time
 
 from nero_enable import DRIVER_ERROR_FIELDS, recent
+from nero_diagnostics import diagnose
 from nero_read_status import FeedbackUnavailableError, connect_nero, feedback_time, print_status, require_feedback
+
+
+# Planning refusals the controller reports about a commanded path:
+# NO_SOLUTION, SINGULARITY_POINT, TARGET_POS_EXCEEDS_LIMIT. They are not
+# faults of the arm, and firmware 1.12 keeps the flag through e-stop, reset,
+# disable and enable (2026-11-16 logs), so a move may have to start with it set.
+REJECTIONS = (2, 3, 4)
+
+
+class ControllerRejected(RuntimeError):
+    """The controller itself refused or abandoned the commanded path."""
 
 
 def _motion_snapshot(robot, *, newer_than=None):
@@ -23,7 +35,13 @@ def _motion_snapshot(robot, *, newer_than=None):
             ("J5/J6 각도", "joint_56"), ("J7 각도", "joint_7"),
         ))
     require_feedback(required, newer_than=newer_than)
-    if status.msg.ctrl_mode != 1 or status.msg.arm_status != 0:
+    # A planning refusal is judged by the caller (see RejectionWatch): only it
+    # knows whether the flag belongs to the current target or an older one.
+    if status.msg.ctrl_mode != 1 or int(status.msg.arm_status) not in (0,) + REJECTIONS:
+        if status.msg.arm_status == 1:
+            raise RuntimeError("EMERGENCY_STOP 상태입니다. nero_reset.py로 먼저 조회하세요. 이동/enable로 해제하지 않습니다.")
+        if status.msg.ctrl_mode == 6:
+            raise RuntimeError("교시 제어 모드가 남아 있습니다. 팔을 지지하고 python nero_teach.py control --firmware v112 --execute로 복귀하세요.")
         raise RuntimeError(
             f"정상 CAN 제어 상태가 아닙니다. ctrl_mode={status.msg.ctrl_mode}, arm_status={status.msg.arm_status}"
         )
@@ -43,6 +61,127 @@ def _motion_snapshot(robot, *, newer_than=None):
 def motion_feedback(robot):
     angles, motion_status, _ = _motion_snapshot(robot)
     return angles, motion_status
+
+
+class RejectionWatch:
+    """Tell a refusal of the target just sent from a flag left by an older command."""
+
+    STALL_S = 2.0  # A leftover flag plus no motion for this long: the new target was not taken.
+
+    def __init__(self, robot, start_angles):
+        self.robot, self.start = robot, list(start_angles)
+        self.leftover = int(robot.get_arm_status().msg.arm_status) in REJECTIONS
+        self.sent = time.monotonic()
+        self.gave_up = False
+
+    def target_sent(self):
+        self.sent = time.monotonic()
+
+    def check(self, angles):
+        """Raise once the controller has refused or abandoned the current target."""
+        status = self.robot.get_arm_status()
+        if int(status.msg.arm_status) not in REJECTIONS:
+            self.leftover = False  # Cleared: any refusal from here on is about this target.
+            return
+        if not self.leftover:
+            self.gave_up = True
+            raise ControllerRejected("컨트롤러가 이 목표의 경로를 거부했습니다: {}. "
+                                     "목표나 방향을 바꿔 다시 시도하세요.".format(status.msg.arm_status))
+        moved = max(abs(a - b) for a, b in zip(angles, self.start))
+        if time.monotonic() - self.sent >= self.STALL_S and moved < math.radians(0.05):
+            self.gave_up = True
+            raise ControllerRejected("이전 경로 거부 표시({})가 새 목표를 보낸 뒤에도 남아 있고 "
+                                     "팔이 움직이지 않습니다.".format(status.msg.arm_status))
+
+    def controller_gave_up(self):
+        """True if, by its own fresh report, the controller is no longer driving to this target."""
+        if self.gave_up:
+            return True
+        status = self.robot.get_arm_status()
+        return recent(status) and not self.leftover and int(status.msg.arm_status) in REJECTIONS
+
+
+class ProgressTimeout:
+    """Expires after ``timeout`` seconds without getting closer to the target.
+
+    A slow but advancing move is not cut off (and e-stopped) just because it
+    takes long; a move that stops advancing still fails after ``timeout``.
+    ``steps`` is the smallest improvement of each error that counts as progress.
+    """
+
+    def __init__(self, timeout, steps):
+        self.timeout, self.steps = timeout, tuple(steps)
+        self.best, self.since = None, time.monotonic()
+
+    def expired(self, errors):
+        now = time.monotonic()
+        if self.best is None:
+            self.best, self.since = list(errors), now
+        for i, (error, step) in enumerate(zip(errors, self.steps)):
+            if error < self.best[i] - step:
+                self.best[i], self.since = error, now
+        return now - self.since >= self.timeout
+
+
+def _verified_still(robot, seconds=0.5):
+    """True only if fresh feedback keeps every joint within 0.05 degrees for the whole window."""
+    started = time.monotonic()
+    lows = highs = last = None
+    fresh = 0
+    while True:
+        angles, _, stamp = _motion_snapshot(robot)  # Raises on stale feedback or a motor fault.
+        lows = angles if lows is None else [min(a, b) for a, b in zip(lows, angles)]
+        highs = angles if highs is None else [max(a, b) for a, b in zip(highs, angles)]
+        if max(h - l for l, h in zip(lows, highs)) > math.radians(0.05):
+            return False
+        if last is None or stamp > last:
+            fresh, last = fresh + 1, stamp
+        if time.monotonic() - started >= seconds:
+            return fresh >= 3
+        time.sleep(0.05)
+
+
+def stop_failed_move(robot, exc, watch):
+    """End a move that failed after its target was sent. Returns True if an e-stop was requested.
+
+    The electronic emergency stop is the SDK's only stop command, and recovering
+    from it means a reset that drops the arm. So it is skipped in exactly one
+    case: the controller itself reports that it refused or abandoned this
+    target, and fresh feedback then shows all joints still for 0.5 s. A timeout,
+    lost feedback, Ctrl+C or any other failure while the controller may still be
+    driving the arm requests the stop immediately, without that wait.
+    """
+    reason = str(exc) or "사용자 중단"
+    print("이동 실패:", type(exc).__name__, reason)
+    still = False
+    try:
+        still = watch is not None and watch.controller_gave_up() and _verified_still(robot)
+    except BaseException as check_error:  # Includes a second Ctrl+C: stop right away.
+        print("정지 상태를 확인하지 못했습니다:", str(check_error) or type(check_error).__name__)
+    if still:
+        diagnose(robot, "emergency_stop_skipped", error=reason)
+        print("컨트롤러가 이미 이 이동을 중단했고 0.5초 동안 관절이 멈춰 있었습니다. 전자 급정지는 보내지 않습니다.")
+        print("모터는 활성화 상태로 남습니다. reset 없이 다른 목표로 다시 시도할 수 있습니다.")
+        return False
+    try:
+        robot.electronic_emergency_stop()
+        diagnose(robot, "emergency_stop_requested", error=reason)
+        print("전자 급정지를 요청했습니다. 실제 정지 여부를 확인하세요.")
+    except Exception as stop_error:
+        print("전자 급정지 전송 실패:", stop_error)
+        print("장비의 물리 비상정지 절차를 따르세요.")
+    return True
+
+
+def require_planned_mode(robot):
+    status = robot.get_arm_status()
+    require_feedback([("이동 모드", status)])
+    if int(status.msg.mode_feedback) not in (0, 1, 2, 3):
+        raise RuntimeError(
+            "일반 위치 이동 모드가 아닙니다: {}. 목표는 보내지 않습니다. "
+            "교시 모드는 control로 복귀하고, CAN/MIT 상태는 팔을 지지한 뒤 "
+            "disable → nero_teach.py prepare --execute → enable 순서로 준비하세요."
+            .format(status.msg.mode_feedback))
 
 
 def wait_for_motion_feedback(robot, *, newer_than=None, timeout=2.0):
@@ -104,6 +243,9 @@ def check_before_move(robot):
                 raise RuntimeError("새 관절 피드백이 충분하지 않아 이동 전 검사를 완료하지 못했습니다.")
             if motion_status == 1:
                 print("이전 목표 미도달 표시(1)가 있지만 관절 변화 검사를 통과했습니다.")
+            leftover = robot.get_arm_status().msg.arm_status
+            if int(leftover) in REJECTIONS:
+                print("이전 경로 거부 표시({})가 남아 있습니다. 팔이 멈춰 있으므로 새 목표를 보낼 수 있습니다.".format(leftover))
             print("이동 전 검사 통과. 새 목표를 전송할 준비가 됐습니다.")
             return angles
         time.sleep(0.05)
@@ -124,36 +266,140 @@ def move_one_joint(robot, joint_index, degrees, timeout=10.0):
     print("현재 각도(deg):", [round(math.degrees(a), 3) for a in start])
     print("목표 각도(deg):", [round(math.degrees(a), 3) for a in target])
     print(f"J{joint_index}를 현재보다 {degrees:+g}도 이동합니다. 속도 비율은 5%입니다.")
+    return _execute_joint_target(robot, target, timeout)
+
+
+def check_speed_percent(speed_percent):
+    if isinstance(speed_percent, bool) or not isinstance(speed_percent, int) or not 1 <= speed_percent <= 100:
+        raise ValueError("속도 비율은 1~100의 정수여야 합니다.")
+    return speed_percent
+
+
+class JointLine:
+    """Targets a short lead ahead on the straight joint-space line to the goal.
+
+    One move_j on firmware 1.12 turns every joint at the same rate, so joints
+    with less travel arrive early and the flange wanders (2026-11-16 log).
+    Re-sending move_j with a target that stays ``lead_degrees`` ahead of the
+    slowest joint keeps all joints at the same fraction of their travel, so
+    they arrive together. If the stream stops, the arm has at most the lead
+    left to travel.
+    """
+
+    def __init__(self, start, target, lead_degrees):
+        self.start, self.target = list(start), list(target)
+        travel = [abs(t - s) for s, t in zip(start, target)]
+        largest = max(travel)
+        # Joints with little travel get targets only a hair ahead; pacing on
+        # them could stall the stream, and they barely move the flange anyway.
+        self.paced = [i for i, d in enumerate(travel) if d >= 0.25 * largest]
+        self.lead = 1.0 if largest < math.radians(lead_degrees) else math.radians(lead_degrees) / largest
+        self.fraction = 0.0
+
+    def advance(self, angles):
+        """The next target if the lead should move forward, otherwise None."""
+        progress = 0.0 if self.lead >= 1.0 else min(
+            (angles[i] - self.start[i]) / (self.target[i] - self.start[i]) for i in self.paced)
+        wanted = min(1.0, max(0.0, progress) + self.lead)
+        if wanted <= self.fraction:
+            return None
+        self.fraction = wanted
+        if wanted >= 1.0:
+            return list(self.target)
+        return [s + (t - s) * wanted for s, t in zip(self.start, self.target)]
+
+
+def move_joint_target(robot, target, timeout=30.0, *, max_step_degrees=5.0, on_feedback=None,
+                      speed_percent=5, allow_long_move=False, lead_degrees=None, update_hz=100.0):
+    """Execute a bounded seven-joint waypoint without enabling motors.
+
+    ``allow_long_move`` lifts the 5-degree waypoint cap for a planned single
+    move; ``max_step_degrees`` still bounds how far the target may be from the
+    posture measured right before sending. With ``lead_degrees`` the joints are
+    led along the straight joint-space line (see JointLine) instead of being
+    given the final target at once; ``update_hz`` is how often that target is
+    moved forward. At 20 Hz the real arm arrived together but ran unevenly
+    (2026-11-16 22:52 log): between updates each joint reached its small target
+    and paused, so the default refreshes five times as often in finer steps.
+    """
+    target = list(target)
+    check_speed_percent(speed_percent)
+    step_cap = 180 if allow_long_move else 5
+    if lead_degrees is not None and (not math.isfinite(lead_degrees) or not 0.5 <= lead_degrees <= 10):
+        raise ValueError("관절 선행 각도는 0.5~10도입니다.")
+    if not math.isfinite(update_hz) or not 10 <= update_hz <= 200:
+        raise ValueError("관절 목표 갱신 빈도는 10~200Hz입니다.")
+    if len(target) != 7 or not all(math.isfinite(a) for a in target):
+        raise ValueError("목표 관절각은 유한한 rad 값 7개여야 합니다.")
+    if not math.isfinite(max_step_degrees) or not 0 < max_step_degrees <= step_cap:
+        raise ValueError("관절 웨이포인트 간격은 0보다 크고 {}도 이하여야 합니다.".format(step_cap))
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("이동 대기 시간은 0보다 큰 유한한 초 값이어야 합니다.")
+    for i, angle in enumerate(target, 1):
+        low, high = robot.get_config()["joint_limits"][f"joint{i}"]
+        if not low <= angle <= high:
+            raise RuntimeError(f"J{i} 목표가 SDK 범위 밖입니다. 이동하지 않습니다.")
+    start = check_before_move(robot)
+    if max(abs(a - b) for a, b in zip(start, target)) > math.radians(max_step_degrees) + 1e-9:
+        raise RuntimeError("현재 자세와 다음 관절 목표가 허용 간격보다 멉니다. 이동하지 않습니다.")
+    return _execute_joint_target(robot, target, timeout, on_feedback=on_feedback, arrival_degrees=0.1,
+                                 speed_percent=speed_percent, lead_degrees=lead_degrees,
+                                 update_hz=update_hz)
+
+
+def _execute_joint_target(robot, target, timeout, *, on_feedback=None, arrival_degrees=0.2,
+                          speed_percent=5, lead_degrees=None, update_hz=100.0):
+    require_planned_mode(robot)
     started = False
+    watch = None
     try:
-        robot.set_speed_percent(5)
+        if on_feedback is not None:
+            on_feedback()
+        start = motion_feedback(robot)[0]
+        watch = RejectionWatch(robot, start)
+        line = None if lead_degrees is None else JointLine(start, target, lead_degrees)
+        robot.set_speed_percent(speed_percent)
         started = True
-        robot.move_j(target)
+        robot.move_j(target if line is None else line.advance(start))
+        watch.target_sent()
+        diagnose(robot, "joint_target_sent", target_rad=target, timeout_s=timeout,
+                 lead_degrees=lead_degrees, update_hz=None if line is None else update_hz)
         print("move_j CAN 명령 전송 완료. 목표 도착을 확인합니다.")
-        deadline = time.monotonic() + timeout
+        waiting = ProgressTimeout(timeout, [math.radians(0.1)])
         reached_samples = 0
+        previous_stamps = None
         while True:
+            if on_feedback is not None:
+                on_feedback()
             angles, motion_status = motion_feedback(robot)
+            watch.check(angles)
+            ahead = None if line is None else line.advance(angles)
+            if ahead is not None:
+                robot.move_j(ahead)
             error = max(abs(a - b) for a, b in zip(angles, target))
-            reached_samples = reached_samples + 1 if motion_status == 0 and error < math.radians(0.2) else 0
+            parser = getattr(robot, "_parser", None)
+            joint = robot.get_joint_angles()
+            stamps = (joint.timestamp,) if parser is None else tuple(
+                getattr(parser, name).timestamp for name in ("joint_12", "joint_34", "joint_56", "joint_7"))
+            reached = motion_status == 0 and error < math.radians(arrival_degrees)
+            if not reached:
+                reached_samples = 0
+            if previous_stamps is None or all(a > b for a, b in zip(stamps, previous_stamps)):
+                reached_samples = reached_samples + 1 if reached else 0
+                previous_stamps = stamps
             if reached_samples >= 3:
                 print("목표 도착 확인. 자동 복귀/비활성화는 하지 않습니다.")
                 return angles
-            if time.monotonic() >= deadline:
+            if waiting.expired([error]):
                 raise RuntimeError(
-                    f"이동 완료 확인 시간 초과: motion_status={int(motion_status)}, "
-                    f"max_joint_error_deg={math.degrees(error):.3f}"
+                    f"이동 완료 확인 시간 초과({timeout:g}초 동안 목표에 가까워지지 않음): "
+                    f"motion_status={int(motion_status)}, max_joint_error_deg={math.degrees(error):.3f}"
                 )
-            time.sleep(0.05)
+            # While the target is still being led forward, refresh it in fine steps.
+            time.sleep(0.05 if line is None or line.fraction >= 1.0 else 1.0 / update_hz)
     except BaseException as exc:
         if started:
-            print("급정지 요청 원인:", type(exc).__name__, str(exc) or "사용자 중단")
-            try:
-                robot.electronic_emergency_stop()
-                print("전자 급정지를 요청했습니다. 실제 정지 여부를 확인하세요.")
-            except Exception as exc:
-                print("전자 급정지 전송 실패:", exc)
-                print("장비의 물리 비상정지 절차를 따르세요.")
+            stop_failed_move(robot, exc, watch)
         raise
 
 

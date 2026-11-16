@@ -86,7 +86,8 @@ class DisabledTargetSlave(NeroCanSlave):
 
 
 class VirtualEnableRegressionTests(unittest.TestCase):
-    def test_reported_state_enables_without_reset_or_target_frames(self):
+    @patch("nero_enable.SessionDiagnostics")
+    def test_reported_state_enables_without_reset_or_target_frames(self, _diagnostics):
         channel = "disabled_target_test_" + uuid.uuid4().hex
         device = DisabledTargetSlave(channel)
         device.start()
