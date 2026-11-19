@@ -1,15 +1,24 @@
-"""Try replacing a retained NO_SOLUTION target with the measured joint posture."""
+"""Clear a retained NO_SOLUTION flag with a straight-line (move_l) command.
+
+On firmware 1.12 the flag belongs to the Cartesian planner. A joint move
+(move_j) leaves it set: the home return of 2026-11-17 18:21 completed with the
+flag still on, and the earlier version of this script, which sent the current
+joint angles, could not clear it (18:29). The next accepted move_l cleared it
+within 0.5 s (2026-11-16 23:50).
+"""
 
 import argparse
 import math
 import time
 
 from nero_diagnostics import SessionDiagnostics, diagnose
-from nero_move_joint import (
-    RejectionWatch, _motion_snapshot, check_before_move, require_planned_mode,
-    stop_failed_move,
-)
-from nero_read_status import connect_nero, feedback_time, print_status
+from nero_move_joint import ControllerRejected, _motion_snapshot, require_planned_mode
+from nero_move_linear import move_linear_target
+from nero_read_status import (FeedbackUnavailableError, connect_nero, feedback_time, print_status,
+                              read_flange_pose)
+
+
+NUDGE_MM = 1.0  # Size of the fallback straight move (down, then back).
 
 
 def recovery_sample(robot):
@@ -38,70 +47,78 @@ def recovery_sample(robot):
     return angles, state, stamps
 
 
-def recover_no_solution(robot, timeout=3.0):
-    """One joint target, no reset/enable/disable. Firmware clearance is not assumed."""
+def wait_for_normal(robot, *, newer_than, timeout=1.0):
+    """True once fresh status feedback (newer than ``newer_than``) reports NORMAL.
+
+    False if fresh feedback keeps reporting the flag; raises if fresh feedback
+    never arrives, so a lost stream is not mistaken for a flag that stayed.
+    """
+    deadline = time.monotonic() + timeout
+    seen, missing = False, None
+    while True:
+        try:
+            _, state, stamps = recovery_sample(robot)
+            if all(stamp > newer_than for stamp in stamps):
+                seen = True
+                if state[1] == 0:
+                    return True
+        except FeedbackUnavailableError as exc:
+            missing = exc
+        if time.monotonic() >= deadline:
+            if not seen and missing is not None:
+                raise missing
+            return False
+        time.sleep(0.02)
+
+
+def recover_no_solution(robot, timeout=5.0):
+    """Send straight-line targets until the flag clears; no reset/enable/disable.
+
+    Attempt 1 sends the measured flange pose itself (no motion). Attempt 2
+    moves the flange NUDGE_MM down and back up (up instead, if the flange is
+    low). Both go through move_linear_target, so feedback, fault and arrival
+    checks and the emergency-stop policy are the same as for any move_l.
+    Returns the joint angles once fresh feedback shows NORMAL.
+    """
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("복구 확인 시간은 0보다 큰 유한한 초 값이어야 합니다.")
-    target, state, _ = recovery_sample(robot)
+    angles, state, _ = recovery_sample(robot)
     if state[1] == 0:
         print("이미 NORMAL입니다. 복구 명령을 보내지 않았습니다.")
-        return target
-    check_before_move(robot)
-    target, state, _ = recovery_sample(robot)
-    if state[1] == 0:
-        print("NORMAL로 바뀌었습니다. 복구 명령을 보내지 않았습니다.")
-        return target
+        return angles
     if not robot.get_auto_set_motion_mode_enabled():
         raise RuntimeError("SDK 자동 이동 모드 전환이 꺼져 있어 목표를 보내지 않습니다.")
-    print("현재 관절각(deg):", [round(math.degrees(q), 3) for q in target])
-    print("이 각도를 그대로 MOVE_J 목표로 한 번 보냅니다. 속도 비율 5%입니다.")
-    watch = RejectionWatch(robot, target)
-    started = False
-    try:
-        started = True
-        robot.set_speed_percent(5)
-        robot.move_j(list(target))
-        # Require telemetry newer than completion of all four target packets.
-        sent_at = feedback_time()
-        watch.target_sent()
-        diagnose(robot, "recovery_target_sent", target_rad=target)
-        deadline = time.monotonic() + timeout
-        previous = None
-        stable_since = None
-        samples = 0
-        while True:
-            angles, state, stamps = recovery_sample(robot)
-            error = max(abs(q - t) for q, t in zip(angles, target))
-            if error > math.radians(0.5):
-                raise RuntimeError("복구 중 관절이 기준보다 0.5도 넘게 변했습니다.")
-            watch.check(angles)
-            confirmed = state == (1, 0, 1, 0) and error < math.radians(0.1)
-            if not confirmed:
-                samples, stable_since = 0, None
-            if (all(stamp > sent_at for stamp in stamps)
-                    and (previous is None or all(a > b for a, b in zip(stamps, previous)))):
-                previous = stamps
-                if confirmed:
-                    samples += 1
-                    if stable_since is None:
-                        stable_since = time.monotonic()
-                    if samples >= 3 and time.monotonic() - stable_since >= 0.2:
-                        diagnose(robot, "recovery_confirmed", target_rad=target)
-                        print("복구 확인: NORMAL / MOVE_J / 목표 도달 / 모터 7개 활성.")
-                        return angles
-            if time.monotonic() >= deadline:
-                raise RuntimeError("복구 미확인: 새 NORMAL / MOVE_J / 목표 도달 피드백이 없습니다.")
-            time.sleep(0.02)
-    except BaseException as exc:
-        if started:
-            stop_failed_move(robot, exc, watch)
-        raise
+    pose, _ = read_flange_pose(robot)
+    nudged = list(pose)
+    nudged[2] += (NUDGE_MM if pose[2] < 0.06 else -NUDGE_MM) / 1000.0
+    attempts = (("현재 위치를 그대로 직선 목표로 보냅니다 (움직임 없음).", [pose]),
+                ("플랜지를 {:g}mm 내렸다가 되돌립니다.".format(NUDGE_MM), [nudged, pose]))
+    for number, (description, targets) in enumerate(attempts, 1):
+        print("복구 시도 {}: {} 속도 5%.".format(number, description))
+        diagnose(robot, "recovery_attempt", attempt=number, targets_m_rad=targets)
+        try:
+            for index, target in enumerate(targets):
+                move_linear_target(robot, target, timeout=timeout, speed_percent=5, settled=index > 0)
+        except ControllerRejected as exc:
+            # The controller kept the flag and did not move: try the next way.
+            print("이 방법으로는 표시가 남았습니다:", exc)
+            continue
+        if wait_for_normal(robot, newer_than=feedback_time()):
+            angles, _, _ = recovery_sample(robot)
+            diagnose(robot, "recovery_confirmed", attempt=number)
+            print("복구 확인: NORMAL / 모터 7개 활성. 자세는 그대로입니다.")
+            return angles
+        print("직선 명령은 끝났지만 NO_SOLUTION 표시가 남았습니다.")
+    raise RuntimeError("직선 명령으로도 NO_SOLUTION 표시가 지워지지 않았습니다. "
+                       "이 표시는 이동을 막지 않습니다(nero_goto, nero_home은 그대로 실행 가능). "
+                       "표시를 반드시 지워야 하면 팔을 받친 상태에서 전원을 껐다 켜세요.")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--channel", default="0")
-    parser.add_argument("--execute", action="store_true", help="현재 관절각을 목표로 보내 복구 시도")
+    parser.add_argument("--execute", action="store_true",
+                        help="직선 명령으로 복구 시도 (현재 위치 그대로, 안 되면 1mm 내렸다 되돌림)")
     args = parser.parse_args()
     robot = diagnostics = None
     try:
@@ -114,7 +131,7 @@ def main():
         time.sleep(1.0)
         diagnostics.event(robot, "connected")
         if args.execute:
-            print("팔을 멈추고 주변을 비우세요. 현재 자세 유지 목표라도 미세한 보정 움직임이 생길 수 있습니다.")
+            print("팔을 멈추고 주변을 비우세요. 필요하면 플랜지가 {:g}mm 움직였다 돌아옵니다.".format(NUDGE_MM))
             recover_no_solution(robot)
         else:
             print("조회만 합니다. 복구 시도: python nero_recover.py --execute")
