@@ -33,6 +33,10 @@ GOOD_LINES = (
 # Start of the line that ended in NO_SOLUTION at 23:19, and the logged home posture before it.
 FAILED_LINE_START = rad(24.7, -10.6, 5.4, 26.3, 9.4, -4.8, -21.5)
 HOME_2026_11_16 = rad(37.0, 5.0, 1.6, -4.8, 1.7, -3.2, -6.1)
+# 2026-11-17 00:07: a direct 467 mm line from here to (-100, 100, 600) mm drifted 20 mm
+# off the line because J1/J5 fell behind (needed 10-15 deg/s, managed about 9).
+DRIFT_START = rad(5.2, -88.3, 9.1, 92.8, 15.6, -25.5, -3.6)
+DRIFT_TARGET = [-0.10, 0.10, 0.60]
 
 
 class ControllerModelTests(unittest.TestCase):
@@ -77,6 +81,27 @@ class ControllerModelTests(unittest.TestCase):
             plan_line(BENT, [0.0, -0.0235, 0.700])
         plan = plan_joint_move(BENT, [0.0, -0.0235, 0.700])
         self.assertEqual(len(plan.line_joints), 1)
+
+    def test_line_the_joints_could_not_follow_is_not_planned_again(self):
+        settings = PlanSettings()
+        # The same direct line, under the controller's arm-angle rule, needs far more than the limit.
+        _, rotation = forward(DRIFT_START)
+        old = plan_line(DRIFT_START, DRIFT_TARGET, settings=PlanSettings(joint_speed_per_percent=100.0))
+        self.assertFalse(old.needs_joint_move)
+        self.assertGreater(old.peak_joint_speed_deg_s, 2 * settings.joint_speed_limit)
+        new = plan_line(DRIFT_START, DRIFT_TARGET)
+        self.assertLessEqual(new.peak_joint_speed_deg_s, settings.joint_speed_limit + 1e-9)
+        self.assertLess(new.straight_mm, old.straight_mm)
+
+    def test_flange_speed_model_ramps_and_scales_with_speed(self):
+        five, ten = PlanSettings(), PlanSettings(speed_percent=10)
+        self.assertEqual(five.flange_speed(0, 100), 0)
+        self.assertAlmostEqual(five.flange_speed(10, 100), math.sqrt(2 * 40 * 10))
+        self.assertAlmostEqual(five.flange_speed(200, 200), 45)
+        self.assertAlmostEqual(ten.flange_speed(500, 500), 90)
+        self.assertAlmostEqual(ten.joint_speed_limit, 2 * five.joint_speed_limit)
+        # The ramp does not scale with the percentage (measured at 5% and 7%).
+        self.assertAlmostEqual(ten.flange_speed(10, 500), five.flange_speed(10, 500))
 
     def test_replanning_the_failed_request_avoids_its_start(self):
         y = forward(HOME_2026_11_16)[0][1]
@@ -191,23 +216,22 @@ class PlanTests(unittest.TestCase):
     def test_upright_start_gets_small_joint_move_then_long_straight_line(self):
         plan = plan_line(UPRIGHT, [0.30, -0.10, 0.40])
         self.assertTrue(plan.needs_joint_move)
-        self.assertLess(plan.joint_move_deg, 45)
-        # A line the controller can drive with a constant arm angle starts farther
-        # from the upright singularity than an unconstrained one would.
-        self.assertGreater(plan.straight_mm, 0.8 * plan.total_mm)
+        # A line the controller can drive (constant arm angle, joints within speed)
+        # starts farther from the upright singularity than an unconstrained one would.
+        self.assertLess(plan.joint_move_deg, 60)
+        self.assertGreater(plan.straight_mm, 0.7 * plan.total_mm)
+        self.assertLessEqual(plan.peak_joint_speed_deg_s, self.settings.joint_speed_limit + 1e-9)
         # The line starts on the segment between the measured start and the target.
         self.assertLess(segment_distance_mm(plan.entry_pose[:3], plan.start_pose[:3], plan.target_pose[:3]), 0.1)
         self.assert_line_is_straight_and_usable(plan)
 
     def test_line_keeps_one_orientation_unless_blending_is_requested(self):
+        # Pointing the tool down from upright forces a large change of orientation.
         target = [-0.35, 0.0, 0.30]
-        fixed = plan_line(UPRIGHT, target)
+        fixed = plan_line(UPRIGHT, target, aim=DOWN)
         self.assertGreater(fixed.orientation_change_deg, 30)  # Done in the joint move.
-        self.assertGreater(fixed.straight_mm, 0.7 * fixed.total_mm)
         self.assert_line_is_straight_and_usable(fixed)
-        blended = plan_line(UPRIGHT, target, settings=PlanSettings(rotate_on_line=True))
-        self.assertLess(blended.joint_move_deg, 60)
-        self.assertGreater(blended.straight_mm, 0.8 * blended.total_mm)
+        blended = plan_line(UPRIGHT, target, aim=DOWN, settings=PlanSettings(rotate_on_line=True))
         self.assertGreater(rotation_angle(forward(blended.line_joints[0])[1],
                                           forward(blended.line_joints[-1])[1]), math.radians(30))
         self.assert_line_is_straight_and_usable(blended, fixed_orientation=False)

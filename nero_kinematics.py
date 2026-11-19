@@ -303,10 +303,12 @@ class PlanSettings:
     limit_margin_deg: float = 2.0    # Stay this far inside the SDK joint limits.
     min_z_mm: float = 50.0           # Lowest allowed height of flange/elbow/wrist origins.
     seeds: int = 24                  # IK restarts used to find target postures.
-    # The straight part keeps the shoulder-wrist axis at least this far from vertical.
-    # The controller's arm-angle reference is undefined there: the failed line of
-    # 2026-11-16 23:19 started at 1.9 degrees, the two good ones at 4.5 and 5.1.
-    min_tilt_deg: float = 3.0
+    # The straight part keeps the shoulder-wrist axis at least this far from vertical,
+    # where the controller's arm-angle reference is undefined. Lines starting at 1.9
+    # degrees failed (23:19); of five starting at 4.3-5.4 degrees, three let the arm
+    # angle slip 1-26 degrees in the first 20 mm (tilt about 6 there) and drifted up
+    # to 10.8 mm (00:06). The line that started at 47 degrees held it to 0.5.
+    min_tilt_deg: float = 8.0
     # False: the straight part is a pure translation and any reorientation
     # happens in the joint move. True blends the orientation along the line;
     # firmware 1.12 crawled and then reported NO_SOLUTION on such a line (2026-11-16).
@@ -316,33 +318,37 @@ class PlanSettings:
     joints_together: bool = True
     # move_l speed model, per percent of speed. Measured at 5% on 2026-11-16/17: the
     # flange cruises at about 45 mm/s after ramping at about 40 mm/s^2, and the
-    # controller does not slow the flange when a joint cannot keep up. A joint
-    # needing more than about 10 deg/s fell behind and pushed the flange off the
-    # line (00:07 run: 1.4 mm at 10.4 deg/s, 16 mm at 14 deg/s). Other speeds
-    # assume everything scales with the percentage; that is not measured yet.
+    # controller barely slows the flange when a joint cannot keep up. In the 00:07
+    # run J1/J5 stayed near 9 deg/s while the line needed 10-15 deg/s for 2 s,
+    # and the flange drifted 1.4 mm (at 10 deg/s needed) to 16 mm (at 14). Brief
+    # needs of 12-18 deg/s were met in other runs (J4 13.6, J5 18.6 deg/s), so the
+    # limit is 12 deg/s at 5%: a few mm of drift is possible near it. The same move
+    # at 7% and 5% (2026-11-17 17:51 / 18:20) scaled joint speed (12.9 vs 9.2 deg/s)
+    # and peak flange speed (75 vs 53 mm/s) by 7:5, but the flange ramp stayed about
+    # 38 mm/s^2 at both, so the ramp is a constant and not per percent.
     speed_percent: int = 5
     flange_speed_per_percent: float = 9.0     # mm/s
-    flange_accel_per_percent: float = 8.0     # mm/s^2
-    joint_speed_per_percent: float = 2.0      # deg/s a joint can follow
+    flange_accel: float = 40.0                # mm/s^2, independent of the speed percentage
+    joint_speed_per_percent: float = 2.4      # deg/s a joint is planned to need at most
 
     def validate(self):
         values = (self.step_mm, self.step_deg, self.max_joint_step_deg, self.min_sigma,
                   self.limit_margin_deg, self.min_z_mm, self.min_tilt_deg, self.flange_speed_per_percent,
-                  self.flange_accel_per_percent, self.joint_speed_per_percent)
+                  self.flange_accel, self.joint_speed_per_percent)
         if not all(math.isfinite(v) for v in values):
             raise ValueError("계획 설정은 유한한 숫자여야 합니다.")
         if not (1 <= self.step_mm <= 20 and 0.5 <= self.step_deg <= 10
                 and 0.5 <= self.max_joint_step_deg <= 15 and 0.005 <= self.min_sigma <= 0.2
                 and 0 <= self.limit_margin_deg <= 10 and 1 <= self.seeds <= 200
                 and 0 <= self.min_tilt_deg <= 30 and 1 <= self.speed_percent <= 100
-                and min(self.flange_speed_per_percent, self.flange_accel_per_percent,
+                and min(self.flange_speed_per_percent, self.flange_accel,
                         self.joint_speed_per_percent) > 0):
             raise ValueError("계획 설정이 허용 범위를 벗어났습니다.")
 
     def flange_speed(self, from_start_mm, to_end_mm):
         """Expected move_l flange speed (mm/s) at a point of a line, ramps included."""
         top = self.flange_speed_per_percent * self.speed_percent
-        accel = self.flange_accel_per_percent * self.speed_percent
+        accel = self.flange_accel
         return min(top, math.sqrt(2 * accel * max(0.0, from_start_mm)),
                    math.sqrt(2 * accel * max(0.0, to_end_mm)))
 
@@ -479,6 +485,14 @@ def _joint_move_trace(start, end, together):
     return length, lowest
 
 
+def joint_move_trace(start_joints, end_joints, together=True):
+    """(flange path length mm, lowest elbow/wrist/flange origin mm) of a joint move.
+
+    For moves that do not go through plan_line, such as nero_home.py.
+    """
+    return _joint_move_trace(_joints(start_joints), _joints(end_joints), together)
+
+
 def _prepare(start_joints, target_xyz, limits, rotation, aim, keep_orientation, settings):
     """Validate a request and find the usable joint postures at the target."""
     settings = settings or PlanSettings()
@@ -530,7 +544,7 @@ def _prepare(start_joints, target_xyz, limits, rotation, aim, keep_orientation, 
     return settings, limits, start, target, postures
 
 
-def _finish(start, target, line, trace):
+def _finish(start, target, line, trace, settings):
     p0, r0 = forward(start)
     entry = line[0]
     entry_position, entry_rotation = forward(entry)
@@ -551,7 +565,8 @@ def _finish(start, target, line, trace):
         min_z_mm=min([trace[1]] + [_lowest_origin_mm(q) for q in line]),
         orientation_change_deg=math.degrees(rotation_angle(r0, end_rotation)),
         arm_angle_deg=math.degrees(arm_angle(entry)),
-        min_tilt_deg=min(math.degrees(wrist_tilt(q)) for q in line))
+        min_tilt_deg=min(math.degrees(wrist_tilt(q)) for q in line),
+        peak_joint_speed_deg_s=_peak_joint_speed(*_segments(line), settings) if len(line) > 1 else 0.0)
 
 
 def plan_line(start_joints, target_xyz, limits=None, *, rotation=None, aim=None,

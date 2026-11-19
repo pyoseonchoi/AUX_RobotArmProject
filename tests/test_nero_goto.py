@@ -116,7 +116,7 @@ class GotoVirtualTests(GotoCase):
         # Joint mode first, then linear mode; default speed; no enable, stop or reset.
         modes = [f.data[1] for f in frames if f.arbitration_id == 0x151 and f.data[1] != 255]
         self.assertEqual(sorted(set(modes), key=modes.index), [1, 2])
-        self.assertTrue(all(f.data[2] == 5 for f in frames if f.arbitration_id == 0x151))
+        self.assertTrue(all(f.data[2] == 7 for f in frames if f.arbitration_id == 0x151))
         # By default the joint target is led forward in steps rather than sent once.
         self.assertGreater(sum(f.arbitration_id == 0x155 for f in frames), 3)
         order = [f.arbitration_id for f in frames if f.arbitration_id in JOINT_IDS + POSE_IDS]
@@ -131,21 +131,23 @@ class GotoVirtualTests(GotoCase):
     def test_joint_path_sends_one_joint_target_at_requested_speed(self):
         plan = plan_joint_move([0.0] * 7, self.target(-350, 300), self.robot.get_config()["joint_limits"])
         self.assertGreater(plan.joint_move_deg, 60)
-        options = FAR + ("--path", "joint", "--joint-move", "single", "--speed", "12", "--execute")
-        self.assertEqual(self.run_goto(*options), 1)  # Above the default 60-degree cap.
+        options = FAR + ("--path", "joint", "--joint-move", "single", "--speed", "7", "--execute")
+        self.assertEqual(self.run_goto(*options, "--max-joint-move-deg", "60"), 1)  # An explicit cap still holds.
         self.assertFalse(self.device.host_frames)
-        self.assertEqual(self.run_goto(*options, "--max-joint-move-deg", "120"), 0)
+        self.assertEqual(self.run_goto(*options), 0)  # The default no longer caps the joint move.
         frames = self.device.host_frames
         for sent, planned in zip(sent_joints(frames), plan.entry_joints):
             self.assertAlmostEqual(sent, planned, delta=math.radians(0.002))
         self.assertEqual(sum(f.arbitration_id == 0x155 for f in frames), 1)
-        self.assertTrue(all(f.data[2] == 12 for f in frames if f.arbitration_id == 0x151))
+        self.assertTrue(all(f.data[2] == 7 for f in frames if f.arbitration_id == 0x151))
         self.assertFalse(any(f.arbitration_id in POSE_IDS + (0x150, 0x471) for f in frames))
 
     def test_unreachable_target_and_bad_options_send_nothing(self):
         self.assertEqual(self.run_goto("--x", "900", "--z", "300", "--execute"), 1)
         with patch("nero_goto.connect_nero", side_effect=AssertionError("Must not connect")):
             for options in (["--execute"], ["--x", "-350", "--speed", "21"], ["--x", "-350", "--speed", "0"],
+                            ["--x", "-350", "--max-deviation-mm", "3"], ["--x", "-350", "--max-deviation-mm", "101"],
+                            ["--x", "-350", "--max-joint-move-deg", "361"], ["--x", "-350", "--max-joint-move-deg", "0"],
                             ["--x", "-350", "--rpy", "0", "0", "0", "--orient", "keep"],
                             ["--x", "-350", "--rpy", "0", "95", "0"], ["--x", "nan"],
                             ["--x", "-350", "--timeout", "0"], ["--x", "-350", "--min-sigma", "0"]):
@@ -165,10 +167,10 @@ class GotoVirtualTests(GotoCase):
         original = self.device._apply_host_command
         def bend(aid, data):
             original(aid, data)
-            if aid == 0x152:  # Report a flange 30 mm beside the commanded straight line.
+            if aid == 0x152:  # Report a flange 60 mm beside the line: past the default 50 mm stop limit.
                 with self.device._state_lock:
                     y = int.from_bytes(self.device.pose_data[0x152][4:], "big", signed=True)
-                    self.device.pose_data[0x152] = self.device.pose_data[0x152][:4] + pair(y + 30000, 0)[:4]
+                    self.device.pose_data[0x152] = self.device.pose_data[0x152][:4] + pair(y + 60000, 0)[:4]
         with patch.object(self.device, "_apply_host_command", side_effect=bend):
             self.assertEqual(self.run_goto(*NEAR, "--execute"), 1)
         self.assertTrue(any(f.arbitration_id == 0x150 and f.data[0] == 1 for f in self.device.host_frames))
@@ -228,6 +230,21 @@ class LineMonitorTests(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         pose.msg[1] = 0.021
         with self.assertRaisesRegex(RuntimeError, "직선에서"):
+            monitor()
+
+    def test_moderate_drift_only_warns_once_and_keeps_going(self):
+        pose = SimpleNamespace(msg=[0.1, 0.0, 0.0, 0, 0, 0])
+        robot = SimpleNamespace(get_flange_pose=lambda: pose, get_arm_status=lambda: None)
+        warnings = []
+        monitor = LineMonitor(robot, [0, 0, 0], [1, 0, 0], 50.0, on_warning=warnings.append)
+        for drift in (0.010, 0.025, 0.040, 0.030, 0.049):
+            pose.msg[1] = drift
+            monitor()  # Never raises below the stop limit.
+        self.assertEqual(len(warnings), 1)
+        self.assertAlmostEqual(warnings[0], 25.0)
+        self.assertAlmostEqual(monitor.worst_mm, 49.0)
+        pose.msg[1] = 0.051
+        with self.assertRaisesRegex(RuntimeError, "정지 한도 50"):
             monitor()
 
     def test_missing_feedback_is_left_to_the_motion_loop(self):
