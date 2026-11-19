@@ -123,6 +123,43 @@ class ProgressTimeout:
         return now - self.since >= self.timeout
 
 
+class ResendGuard:
+    """Says when to send the same target again because part of it was not applied.
+
+    A move_j goes out as four CAN frames (J1/J2, J3/J4, J5/J6, J7) and a move_l
+    as three. On 2026-11-18 01:28 a teaching waypoint moved J7 but left J2
+    exactly at the previous waypoint while the controller reported "reached"
+    (motion_status 0): the J1/J2 frame was most likely not applied, and the old
+    code waited 30 s and failed. Re-sending the same target is harmless.
+    Resend when the controller says it is done, the measured errors are above
+    tolerance and have not improved for WAIT_S since the last send.
+    """
+
+    WAIT_S = 0.6
+    MAX_RESENDS = 3
+
+    def __init__(self, steps):
+        self.steps = tuple(steps)
+        self.best, self.improved_at, self.sent_at, self.resends = None, time.monotonic(), time.monotonic(), 0
+
+    def sent(self):
+        self.sent_at = time.monotonic()
+
+    def due(self, controller_done, errors):
+        now = time.monotonic()
+        if self.best is None:
+            self.best = list(errors)
+        for i, (error, step) in enumerate(zip(errors, self.steps)):
+            if error < self.best[i] - step:
+                self.best[i], self.improved_at = error, now
+        if (controller_done and self.resends < self.MAX_RESENDS
+                and now - self.improved_at >= self.WAIT_S and now - self.sent_at >= self.WAIT_S):
+            self.resends += 1
+            self.improved_at = now
+            return True
+        return False
+
+
 def _verified_still(robot, seconds=0.5):
     """True only if fresh feedback keeps every joint within 0.05 degrees for the whole window."""
     started = time.monotonic()
@@ -324,7 +361,7 @@ def move_joint_target(robot, target, timeout=30.0, *, max_step_degrees=5.0, on_f
     """
     target = list(target)
     check_speed_percent(speed_percent)
-    step_cap = 180 if allow_long_move else 5
+    step_cap = 360 if allow_long_move else 5  # 360: no cap beyond the joint ranges themselves.
     if lead_degrees is not None and (not math.isfinite(lead_degrees) or not 0.5 <= lead_degrees <= 10):
         raise ValueError("관절 선행 각도는 0.5~10도입니다.")
     if not math.isfinite(update_hz) or not 10 <= update_hz <= 200:
@@ -360,8 +397,10 @@ def _execute_joint_target(robot, target, timeout, *, on_feedback=None, arrival_d
         line = None if lead_degrees is None else JointLine(start, target, lead_degrees)
         robot.set_speed_percent(speed_percent)
         started = True
-        robot.move_j(target if line is None else line.advance(start))
+        last_sent = list(target) if line is None else line.advance(start)
+        robot.move_j(last_sent)
         watch.target_sent()
+        resend = ResendGuard([math.radians(0.05)])
         diagnose(robot, "joint_target_sent", target_rad=target, timeout_s=timeout,
                  lead_degrees=lead_degrees, update_hz=None if line is None else update_hz)
         print("move_j CAN 명령 전송 완료. 목표 도착을 확인합니다.")
@@ -375,8 +414,17 @@ def _execute_joint_target(robot, target, timeout, *, on_feedback=None, arrival_d
             watch.check(angles)
             ahead = None if line is None else line.advance(angles)
             if ahead is not None:
+                last_sent = ahead
                 robot.move_j(ahead)
+                resend.sent()
             error = max(abs(a - b) for a, b in zip(angles, target))
+            if error >= math.radians(arrival_degrees) and resend.due(motion_status == 0, [error]):
+                robot.move_j(last_sent)
+                resend.sent()
+                diagnose(robot, "joint_target_resent", target_rad=last_sent, error_deg=math.degrees(error),
+                         resend=resend.resends)
+                print("컨트롤러가 도달을 보고했지만 관절이 목표에서 {:.2f}도 떨어져 있어 같은 목표를 다시 보냅니다 ({}회).".format(
+                    math.degrees(error), resend.resends))
             parser = getattr(robot, "_parser", None)
             joint = robot.get_joint_angles()
             stamps = (joint.timestamp,) if parser is None else tuple(

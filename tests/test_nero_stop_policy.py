@@ -10,8 +10,8 @@ import time
 import unittest
 from unittest.mock import patch
 
-from nero_move_joint import (ControllerRejected, ProgressTimeout, RejectionWatch, check_before_move,
-                             move_joint_target)
+from nero_move_joint import (ControllerRejected, ProgressTimeout, RejectionWatch, ResendGuard,
+                             check_before_move, move_joint_target)
 from nero_move_linear import move_linear_target
 from nero_read_status import FeedbackUnavailableError
 from nero_repeat_air import read_sample
@@ -28,6 +28,7 @@ class PolicySlave(TeachingSlave):
     """Joint and pose targets are echoed as feedback unless a test says otherwise."""
 
     def __init__(self, channel):
+        self.drop_once = set()        # Target frame IDs to ignore once, like a frame that was not applied.
         self.reject_poses = False     # Answer a pose target with NO_SOLUTION and do not move.
         self.clear_on_target = True   # An accepted target clears an older refusal flag.
         self.drift_after_reject = False
@@ -37,6 +38,9 @@ class PolicySlave(TeachingSlave):
         super().__init__(channel)
 
     def _apply_host_command(self, aid, data):
+        if aid in self.drop_once:
+            self.drop_once.discard(aid)
+            return
         if aid in POSE_IDS and self.reject_poses:
             self.reported_arm_status = NO_SOLUTION
             self.drifting = self.drift_after_reject
@@ -169,6 +173,35 @@ class StopPolicyTests(VirtualRobotCase):
         actual = move_joint_target(self.robot, joints(2), timeout=0.2)
         self.assertAlmostEqual(actual[0], math.radians(2), places=4)
         self.assertFalse(self.stops())
+
+    def frames(self, aid):
+        return [f for f in self.device.host_frames if f.arbitration_id == aid]
+
+    def test_joint_frame_not_applied_is_resent(self):
+        # Replays 2026-11-18 01:28: J7 moved, J1/J2 frame not applied, controller said "reached".
+        self.device.drop_once = {0x155}
+        target = joints(1)
+        target[6] = math.radians(1)
+        actual = move_joint_target(self.robot, target, timeout=5)
+        self.assertAlmostEqual(actual[0], math.radians(1), places=4)
+        self.assertEqual(len(self.frames(0x155)), 2)
+        self.assertEqual(len(self.frames(0x170)), 2)  # The whole target is sent again.
+        self.assertFalse(self.stops())
+
+    def test_pose_frame_not_applied_is_resent(self):
+        self.device.drop_once = {0x153}  # Z/roll part of the pose target.
+        target = self.line_target()
+        actual = move_linear_target(self.robot, target, timeout=5)
+        self.assertAlmostEqual(actual[2], target[2], places=5)
+        self.assertEqual(len(self.frames(0x153)), 2)
+        self.assertFalse(self.stops())
+
+    def test_resends_are_limited_and_then_the_timeout_applies(self):
+        self.device.accept_joints = False
+        with self.assertRaisesRegex(RuntimeError, "시간 초과"):
+            move_joint_target(self.robot, joints(1), timeout=3)
+        self.assertEqual(len(self.frames(0x155)), 1 + ResendGuard.MAX_RESENDS)
+        self.wait_for_stop()
 
     def test_recorder_health_leaves_refusals_to_the_motion_loop(self):
         self.leave_old_refusal()

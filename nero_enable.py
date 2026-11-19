@@ -61,7 +61,7 @@ def check_before_enable(robot, *, allow_disabled_not_reached=False, allow_enable
 
 
 def enable_only(robot, timeout=5.0):
-    """Enable independently of old planning errors; require new driver feedback."""
+    """Enable independently of joint range/planning errors; verify new feedback."""
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("활성화 대기 시간은 0보다 큰 유한한 값이어야 합니다.")
     deadline = time.monotonic() + timeout
@@ -72,6 +72,7 @@ def enable_only(robot, timeout=5.0):
             raise RuntimeError("EMERGENCY_STOP 상태입니다. enable은 급정지를 해제하지 않습니다. nero_reset.py로 상태를 확인하세요.")
         # SDK/controller protection remains in force. A previous NO_SOLUTION
         # or unreached target is not a PC-side prerequisite for motor enable.
+        # Joint range is checked for motion targets, not this power request.
         robot.enable(timeout=0.0)
         status = robot.get_arm_status()
         if recent(status) and status.msg.arm_status == 1:

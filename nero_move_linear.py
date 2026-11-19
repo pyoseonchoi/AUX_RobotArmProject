@@ -6,7 +6,7 @@ import time
 
 from pyAgxArm.utiles.tf import euler_convert_quat
 from nero_enable import recent
-from nero_move_joint import (ProgressTimeout, RejectionWatch, check_before_move, check_speed_percent,
+from nero_move_joint import (ProgressTimeout, RejectionWatch, ResendGuard, check_before_move, check_speed_percent,
                              motion_feedback, require_planned_mode, stop_failed_move,
                              wait_for_motion_feedback)
 from nero_read_status import FeedbackUnavailableError, connect_nero, feedback_time, print_status, require_feedback, read_flange_pose
@@ -88,6 +88,7 @@ def _execute_linear_target(robot, target, timeout, *, on_feedback=None, speed_pe
         sent_at = feedback_time()
         robot.move_l(target.copy())
         watch.target_sent()
+        resend = ResendGuard([0.0002, math.radians(0.2)])
         diagnose(robot, "linear_target_sent", target_m_rad=target, timeout_s=timeout)
         print("move_l CAN 명령 전송 완료. 컨트롤러 상태와 목표 위치 오차를 확인합니다.")
         waiting = ProgressTimeout(timeout, [0.0005, math.radians(0.5)])
@@ -114,6 +115,14 @@ def _execute_linear_target(robot, target, timeout, *, on_feedback=None, speed_pe
             if previous_stamps is None or all(a > b for a, b in zip(stamps, previous_stamps)):
                 reached_samples = reached_samples + 1 if reached else 0
                 previous_stamps = stamps
+            off_target = position_error >= 0.0005 or angle_error >= math.radians(1)
+            if off_target and resend.due(motion_status == 0, [position_error, angle_error]):
+                robot.move_l(target.copy())
+                resend.sent()
+                diagnose(robot, "linear_target_resent", target_m_rad=target,
+                         position_error_mm=position_error * 1000, resend=resend.resends)
+                print("컨트롤러가 도달을 보고했지만 위치가 목표에서 {:.2f}mm 떨어져 있어 같은 목표를 다시 보냅니다 ({}회).".format(
+                    position_error * 1000, resend.resends))
             if time.monotonic() - last_log >= 0.5:
                 diagnose(robot, "linear_progress", position_error_mm=position_error * 1000,
                          orientation_error_deg=math.degrees(angle_error))

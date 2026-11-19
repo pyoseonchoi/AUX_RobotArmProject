@@ -82,7 +82,7 @@ class JointLineVirtualTests(VirtualRobotCase):
         with self.assertRaisesRegex(RuntimeError, "시간 초과"):
             move_joint_target(self.robot, rad(20, 4), timeout=0.3, max_step_degrees=25,
                               allow_long_move=True, lead_degrees=2)
-        self.assertEqual(self.sent_j1(), [2.0])
+        self.assertEqual(set(self.sent_j1()), {2.0})  # Resends repeat the lead target, never go past it.
 
     def test_lead_must_be_reasonable(self):
         for lead in (0, 0.2, 11, float("nan")):
