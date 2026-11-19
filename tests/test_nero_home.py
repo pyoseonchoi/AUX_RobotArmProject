@@ -82,6 +82,20 @@ class HomeTests(VirtualRobotCase):
             return_home(self.robot, home)
         self.assertFalse(self.device.host_frames)
 
+    def test_large_return_is_allowed_by_default(self):
+        # 2026-11-17: a return needing 106-113 degrees was refused by the old 100-degree cap.
+        home = self.home()
+        home["joints_rad"][0] += math.radians(120)  # This virtual arm keeps reporting the same flange pose.
+        return_home(self.robot, home, timeout=5)
+        self.assertAlmostEqual(self.robot.get_joint_angles().msg[0], home["joints_rad"][0], places=4)
+
+    def test_return_that_dips_too_low_sends_nothing(self):
+        home = self.home()
+        home["joints_rad"][0] += math.radians(3)
+        with self.assertRaisesRegex(RuntimeError, "최저|내려갑니다"):
+            return_home(self.robot, home, min_z_mm=5000)
+        self.assertFalse(self.device.host_frames)
+
     def test_flange_mismatch_is_not_success(self):
         home = self.home()
         home["joints_rad"][0] += math.radians(1)

@@ -8,6 +8,7 @@ from pathlib import Path
 import time
 
 from nero_diagnostics import SessionDiagnostics
+from nero_kinematics import joint_move_trace
 from nero_move_joint import move_joint_target
 from nero_move_linear import orientation_error
 from nero_read_status import (FeedbackUnavailableError, connect_nero, feedback_time,
@@ -95,7 +96,25 @@ def show_home(home):
     print("초기화 관절각 (deg):", [round(math.degrees(v), 3) for v in home["joints_rad"]])
 
 
-def return_home(robot, home, *, timeout=60.0, max_joint_move_deg=100.0):
+DEFAULT_SPEED_PERCENT = 7  # Same default and upper bound as nero_goto.py --speed.
+MAX_SPEED_PERCENT = 20
+START_DELAY_S = 3.0        # Time to abort with Ctrl+C before a real return starts.
+
+
+def check_return_path(angles, home, min_z_mm):
+    """Flange path length (mm) and lowest elbow/wrist/flange height (mm) of the return.
+
+    Replaces a fixed joint-travel cap: a large swing is allowed as long as the
+    arm does not dip toward the table on the way. No collision check otherwise.
+    """
+    path_mm, lowest_mm = joint_move_trace(angles, home["joints_rad"], together=True)
+    if lowest_mm < min_z_mm:
+        raise RuntimeError("복귀 중 팔꿈치·손목·플랜지가 높이 {:.0f}mm까지 내려갑니다 (한도 {:g}mm). "
+                           "팔을 먼저 위쪽으로 옮긴 뒤 복귀하세요.".format(lowest_mm, min_z_mm))
+    return path_mm, lowest_mm
+
+
+def return_home(robot, home, *, timeout=60.0, max_joint_move_deg=360.0, speed_percent=5, min_z_mm=50.0):
     target = home["joints_rad"]
     angles, pose = read_posture(robot)
     if (max(abs(a - b) for a, b in zip(angles, target)) < math.radians(0.1)
@@ -103,8 +122,9 @@ def return_home(robot, home, *, timeout=60.0, max_joint_move_deg=100.0):
             and orientation_error(pose, home["flange_pose_m_rad"]) < math.radians(1)):
         print("이미 초기화 위치·자세입니다. 이동 명령을 보내지 않습니다.")
         return
+    check_return_path(angles, home, min_z_mm)
     move_joint_target(robot, target, timeout=timeout, max_step_degrees=max_joint_move_deg,
-                      speed_percent=5, allow_long_move=True, lead_degrees=2.0)
+                      speed_percent=speed_percent, allow_long_move=True, lead_degrees=2.0)
     _, pose = read_posture(robot)
     error_mm = math.dist(pose[:3], home["flange_pose_m_rad"][:3]) * 1000
     if error_mm >= 2 or orientation_error(pose, home["flange_pose_m_rad"]) >= math.radians(1):
@@ -120,14 +140,23 @@ def main():
     action.add_argument("--save-current", action="store_true", help="현재 자세를 새 파일로 저장 (이동 없음, 덮어쓰기 없음)")
     action.add_argument("--execute", action="store_true", help="저장한 초기화 자세로 실제 이동")
     parser.add_argument("--timeout", type=float, default=60.0, help="목표에 가까워지지 않는 최대 시간(초)")
-    parser.add_argument("--max-joint-move-deg", type=float, default=100.0, help="관절별 최대 이동각(도), 기본 100")
+    parser.add_argument("--max-joint-move-deg", type=float, default=360.0,
+                        help="관절별 최대 이동각(도), 0~360. 기본 360(사실상 제한 없음)")
+    parser.add_argument("--min-z-mm", type=float, default=50.0,
+                        help="복귀 중 팔꿈치·손목·플랜지의 최저 허용 높이(mm). 기본 50. 충돌 검사는 아님")
+    parser.add_argument("--speed", type=int, default=DEFAULT_SPEED_PERCENT,
+                        help="속도 비율(%%), 1~{}. 기본 {}".format(MAX_SPEED_PERCENT, DEFAULT_SPEED_PERCENT))
     args = parser.parse_args()
     robot = diagnostics = None
     try:
         if not math.isfinite(args.timeout) or args.timeout <= 0:
             raise ValueError("timeout은 0보다 큰 유한한 값이어야 합니다.")
-        if not math.isfinite(args.max_joint_move_deg) or not 0 < args.max_joint_move_deg <= 180:
-            raise ValueError("관절 이동 한도는 0보다 크고 180도 이하여야 합니다.")
+        if not 1 <= args.speed <= MAX_SPEED_PERCENT:
+            raise ValueError("속도 비율은 1~{}%입니다.".format(MAX_SPEED_PERCENT))
+        if not math.isfinite(args.max_joint_move_deg) or not 0 < args.max_joint_move_deg <= 360:
+            raise ValueError("관절 이동 한도는 0보다 크고 360도 이하여야 합니다.")
+        if not math.isfinite(args.min_z_mm):
+            raise ValueError("최저 높이는 유한한 mm 값이어야 합니다.")
         if args.save_current:
             if args.position.exists():
                 raise FileExistsError("이미 저장한 초기화 위치입니다. 새 위치는 --position으로 다른 파일을 지정하세요.")
@@ -152,10 +181,21 @@ def main():
             print("현재 XYZ (mm):", [round(v * 1000, 3) for v in pose[:3]])
             travel = max(abs(a - b) for a, b in zip(angles, home["joints_rad"]))
             print("최대 관절 이동각: {:.3f}도 / 한도 {:g}도".format(math.degrees(travel), args.max_joint_move_deg))
-            print("복귀 경로: 관절 동시 이동, 속도 5%. 플랜지의 경로는 직선이 아니며 장애물 회피는 하지 않습니다.")
+            print("복귀 경로: 관절 동시 이동, 속도 {}%. 플랜지의 경로는 직선이 아니며 장애물 회피는 하지 않습니다.".format(
+                args.speed))
+            path_mm, lowest_mm = joint_move_trace(angles, home["joints_rad"], together=True)
+            print("복귀 중 플랜지 이동 거리 약 {:.0f}mm / 팔꿈치·손목·플랜지 최저 높이 {:.0f}mm (한도 {:g}mm)".format(
+                path_mm, lowest_mm, args.min_z_mm))
+            if math.degrees(travel) > 90:
+                print("큰 관절 이동입니다. 팔 전체가 넓게 휘돌아 가므로 주변 공간을 확인하세요.")
             if args.execute:
-                print("이미 활성화된 모터로 복귀합니다. 자동 enable/reset은 하지 않습니다.")
-                return_home(robot, home, timeout=args.timeout, max_joint_move_deg=args.max_joint_move_deg)
+                check_return_path(angles, home, args.min_z_mm)
+                if travel >= math.radians(0.1):
+                    print("이미 활성화된 모터로 복귀합니다. 자동 enable/reset은 하지 않습니다.")
+                    print("{:g}초 후 복귀를 시작합니다. 중단하려면 Ctrl+C.".format(START_DELAY_S))
+                    time.sleep(START_DELAY_S)
+                return_home(robot, home, timeout=args.timeout, max_joint_move_deg=args.max_joint_move_deg,
+                            speed_percent=args.speed, min_z_mm=args.min_z_mm)
             else:
                 print("미리보기 완료. 실제 복귀: python nero_home.py --execute")
         diagnostics.event(robot, "completed")
