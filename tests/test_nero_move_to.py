@@ -3,6 +3,8 @@
 import contextlib
 import io
 import math
+from pathlib import Path
+import tempfile
 import threading
 import time
 import unittest
@@ -35,10 +37,12 @@ class TargetTests(unittest.TestCase):
         self.assertAlmostEqual(distance, 5.0)
 
     def test_euclidean_distance_limit_and_explicit_limit(self):
+        _, distance = make_target(self.start, [130, 240, 300])
+        self.assertAlmostEqual(distance, 50)
         with self.assertRaises(ValueError):
-            make_target(self.start, [120, 220, 300])
-        _, distance = make_target(self.start, [120, 220, 300], max_distance_mm=50)
-        self.assertAlmostEqual(distance, math.sqrt(800))
+            make_target(self.start, [140, 240, 300])
+        _, distance = make_target(self.start, [140, 240, 300], max_distance_mm=70)
+        self.assertAlmostEqual(distance, math.sqrt(3200))
 
     def test_nonfinite_coordinates_and_invalid_limits(self):
         for value in (float("nan"), float("inf"), -float("inf")):
@@ -119,6 +123,11 @@ class VirtualRobotCase(unittest.TestCase):
 
     def setUp(self):
         channel = "absolute_xyz_test_" + uuid.uuid4().hex
+        log_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(log_directory.cleanup)
+        log_patch = patch("nero_diagnostics.DEFAULT_ROOT", Path(log_directory.name))
+        log_patch.start()
+        self.addCleanup(log_patch.stop)
         self.device = self.slave_type(channel)
         self.device.start()
         self.robot = AgxArmFactory.create_arm(create_agx_arm_config(
@@ -261,7 +270,7 @@ class InteractiveInputTests(VirtualRobotCase):
     def test_drift_during_input_rechecks_distance_limit(self):
         def change_position():
             with self.device._state_lock:
-                self.device.pose_data[0x152] = (150000).to_bytes(4, "big", signed=True) + (-200000).to_bytes(4, "big", signed=True)
+                self.device.pose_data[0x152] = (200000).to_bytes(4, "big", signed=True) + (-200000).to_bytes(4, "big", signed=True)
         self.on_reconnect = change_position
         with patch("nero_move_to.connect_nero", side_effect=self.reconnect):
             with patch("builtins.input", side_effect=("103", "-198", "405")):

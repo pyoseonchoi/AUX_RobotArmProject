@@ -49,17 +49,21 @@ def require_feedback(feedbacks, *, newer_than=None):
         raise FeedbackUnavailableError("필요한 최신 피드백이 없습니다: " + "; ".join(missing))
 
 
-def connect_nero(channel="0"):
+def connect_nero(channel="0", *, progress=None):
     """Query firmware, then reconnect with its matching Windows CAN driver."""
+    report = progress if progress is not None else lambda message: None
+    report(f"USB-CAN 채널 {channel} 열기 / SDK 생성 중...")
     robot = AgxArmFactory.create_arm(
         create_agx_arm_config(
             robot=ArmModel.NERO, interface="agx_cando", channel=channel
         )
     )
     try:
+        report("CAN 수신 연결 시작 중...")
         robot.connect()
         firmware = None
-        for _ in range(3):
+        for attempt in range(3):
+            report(f"로봇 펌웨어 응답 대기 ({attempt + 1}/3)...")
             firmware = robot.get_firmware(timeout=1.0, min_interval=0.0)
             if firmware is not None:
                 break
@@ -72,8 +76,10 @@ def connect_nero(channel="0"):
         version = firmware["software_version"]
         profile = resolve_firmware_profile(ArmModel.NERO, version)
     finally:
+        report("펌웨어 조회 연결 정리 중...")
         robot.disconnect()
 
+    report(f"펌웨어 {version} 확인. {profile} 드라이버로 USB-CAN 다시 여는 중...")
     robot = AgxArmFactory.create_arm(
         create_agx_arm_config(
             robot=ArmModel.NERO,
@@ -83,6 +89,7 @@ def connect_nero(channel="0"):
         )
     )
     try:
+        report("버전에 맞는 CAN 수신 연결 시작 중...")
         robot.connect()
     except Exception:
         robot.disconnect()
@@ -90,10 +97,26 @@ def connect_nero(channel="0"):
     return robot, version, profile
 
 
+def read_flange_pose(robot, *, newer_than=None):
+    """Read all six flange coordinates only when every CAN component is fresh."""
+    feedback = robot.get_flange_pose()
+    required = [("플랜지 통합값", feedback)]
+    parser = getattr(robot, "_parser", None)
+    if parser is not None:
+        required.extend((name, getattr(parser, attr, None)) for name, attr in (
+            ("플랜지 X/Y", "end_pose_xy"), ("플랜지 Z/roll", "end_pose_zrx"),
+            ("플랜지 pitch/yaw", "end_pose_ryrz"),
+        ))
+    require_feedback(required, newer_than=newer_than)
+    pose = list(feedback.msg)
+    if len(pose) != 6 or not all(math.isfinite(value) for value in pose):
+        raise RuntimeError("플랜지 위치/자세 6개 값을 확인하지 못했습니다.")
+    return pose, feedback.timestamp
+
+
 def print_status(robot):
     joint = robot.get_joint_angles()
     status = robot.get_arm_status()
-    pose = robot.get_flange_pose()
     if joint is None:
         print("관절 피드백: 아직 수신되지 않았습니다.")
     else:
@@ -115,8 +138,15 @@ def print_status(robot):
         print("상태 피드백: 아직 수신되지 않았습니다.")
     else:
         print(status.msg)
-    if pose is not None:
-        print("플랜지 위치/자세 (m, rad):", [round(v, 6) for v in pose.msg])
+    try:
+        pose, _ = read_flange_pose(robot)
+    except RuntimeError as exc:
+        print("현재 XYZ 확인 불가:", exc)
+    else:
+        print("현재 XYZ (mm, 베이스 기준 / 플랜지): X={:.3f}, Y={:.3f}, Z={:.3f}".format(
+            *[v * 1000 for v in pose[:3]]))
+        print("현재 방향 RPY (deg):", [round(math.degrees(v), 3) for v in pose[3:]])
+        print("플랜지 위치/자세 (m, rad):", [round(v, 6) for v in pose])
 
 
 def main():
@@ -124,8 +154,9 @@ def main():
     parser.add_argument("--channel", default="0", help="Windows CAN 채널 (기본: 0)")
     parser.add_argument("--watch", action="store_true", help="1초 간격으로 계속 표시")
     args = parser.parse_args()
+    print("상태 조회 시작: USB-CAN 연결과 펌웨어를 확인합니다. 모터/이동 명령은 보내지 않습니다.", flush=True)
     try:
-        robot, version, profile = connect_nero(args.channel)
+        robot, version, profile = connect_nero(args.channel, progress=lambda message: print(message, flush=True))
     except Exception as exc:
         parser.exit(status=1, message="상태 조회 연결 실패: {}\n".format(exc))
     try:

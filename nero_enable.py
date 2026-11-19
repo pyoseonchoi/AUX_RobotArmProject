@@ -1,10 +1,11 @@
-"""Beginner step 2: enable Nero motors and verify CAN control; no move targets."""
+"""Request motor enable and verify all seven motors; never send motion/reset."""
 
 import argparse
 import math
 import time
 
-from nero_read_status import connect_nero, print_status, recent
+from nero_read_status import connect_nero, feedback_time, print_status, recent
+from nero_diagnostics import SessionDiagnostics
 
 
 DRIVER_ERROR_FIELDS = (
@@ -14,7 +15,7 @@ DRIVER_ERROR_FIELDS = (
 
 
 def check_before_enable(robot, *, allow_disabled_not_reached=False, allow_enabled_not_reached=False):
-    """Check enable state without sending targets or clearing an old target flag."""
+    """Legacy strict check for callers that need it; the enable CLI does not use it."""
     joint = robot.get_joint_angles()
     status = robot.get_arm_status()
     if not recent(joint) or not recent(status):
@@ -59,20 +60,32 @@ def check_before_enable(robot, *, allow_disabled_not_reached=False, allow_enable
     return disabled_not_reached
 
 
-def enable_only(robot):
-    deadline = time.monotonic() + 5.0
+def enable_only(robot, timeout=5.0):
+    """Enable independently of joint range/planning errors; verify new feedback."""
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("활성화 대기 시간은 0보다 큰 유한한 값이어야 합니다.")
+    deadline = time.monotonic() + timeout
+    requested_at = feedback_time()
     while True:
-        robot.enable()
         status = robot.get_arm_status()
+        if recent(status) and status.msg.arm_status == 1:
+            raise RuntimeError("EMERGENCY_STOP 상태입니다. enable은 급정지를 해제하지 않습니다. nero_reset.py로 상태를 확인하세요.")
+        # SDK/controller protection remains in force. A previous NO_SOLUTION
+        # or unreached target is not a PC-side prerequisite for motor enable.
+        # Joint range is checked for motion targets, not this power request.
+        robot.enable(timeout=0.0)
+        status = robot.get_arm_status()
+        if recent(status) and status.msg.arm_status == 1:
+            raise RuntimeError("활성화 요청 중 EMERGENCY_STOP이 보고됐습니다. 급정지를 자동 해제하지 않습니다.")
         drivers = [robot.get_driver_states(i) for i in range(1, 8)]
-        if (recent(status) and status.msg.ctrl_mode == 1
-                and status.msg.arm_status == 0
-                and all(recent(d) and d.msg.foc_status.driver_enable_status for d in drivers)):
+        if all(recent(d) and d.timestamp > requested_at
+               and d.msg.foc_status.driver_enable_status for d in drivers):
             return
-        if recent(status) and status.msg.arm_status not in (0, 6):
-            raise RuntimeError("활성화 중 로봇 오류가 보고됐습니다.")
         if time.monotonic() >= deadline:
-            raise RuntimeError("활성화/CAN 제어/정상 상태를 제한 시간 내 확인하지 못했습니다.")
+            pending = [f"J{i}" for i, d in enumerate(drivers, 1)
+                       if not (recent(d) and d.timestamp > requested_at
+                               and d.msg.foc_status.driver_enable_status)]
+            raise RuntimeError("enable을 요청했지만 모터 활성화를 확인하지 못했습니다: " + ", ".join(pending))
         time.sleep(0.1)
 
 
@@ -81,45 +94,50 @@ def main():
     parser.add_argument("--channel", default="0", help="Windows CAN 채널 (기본: 0)")
     args = parser.parse_args()
     robot = None
-    attempted = False
+    diagnostics = None
     try:
-        print("2단계: 모터 활성화 전 상태를 확인합니다. 브레이크 해제 시 자세가 달라질 수 있습니다.")
-        print("이동 목표는 보내지 않습니다. 주변을 비우고 다른 제어 프로그램의 동작을 중지하세요.")
+        print("모터를 활성화합니다. 브레이크 해제 시 자세가 달라질 수 있으므로 팔과 도구 주변을 비우세요.")
+        diagnostics = SessionDiagnostics()
+        print("실행 진단 로그:", diagnostics.path.resolve())
+        diagnostics.event(None, "start", command="enable")
         robot, version, profile = connect_nero(args.channel)
         print(f"펌웨어: {version} / SDK 드라이버: {profile}")
         time.sleep(1.0)
-        if check_before_enable(robot, allow_disabled_not_reached=True, allow_enabled_not_reached=True):
-            print("모터 7개 비활성화/브레이크 미해제 상태에서 목표 미도달 표시가 있습니다.")
-            print("이 표시만으로 활성화를 막지 않고 enable을 요청합니다. reset/이동 목표는 보내지 않습니다.")
+        diagnostics.event(robot, "connected")
         status = robot.get_arm_status()
         drivers = [robot.get_driver_states(i) for i in range(1, 8)]
-        if (recent(status) and status.msg.ctrl_mode == 1 and status.msg.arm_status == 0
+        if recent(status) and status.msg.arm_status == 1:
+            raise RuntimeError("EMERGENCY_STOP 상태입니다. enable은 급정지를 해제하지 않습니다. nero_reset.py로 상태를 확인하세요.")
+        if (recent(status)
                 and all(recent(d) and d.msg.foc_status.driver_enable_status for d in drivers)):
-            print("이미 모터 7개가 활성화된 정상 CAN 제어 상태입니다. enable을 다시 보내지 않습니다.")
+            print("이미 모터 7개가 활성화되어 있습니다.")
         else:
-            print("사전 검사 통과. 모터 활성화 요청을 보냅니다.")
-            attempted = True
+            print("enable 요청을 보냅니다.")
+            diagnostics.event(robot, "enable_requested")
             enable_only(robot)
         print_status(robot)
-        print("2단계 완료: 모터 7개 활성화 / CAN 제어 / 정상 상태를 확인했습니다.")
+        print("enable 완료: 모터 7개 활성화를 확인했습니다.")
         status = robot.get_arm_status()
-        if recent(status) and status.msg.motion_status != 0:
-            print("이전 목표 미도달 표시는 남아 있습니다. 이동 프로그램에서 관절 변화를 관찰한 뒤 새 목표를 보냅니다.")
+        if recent(status) and status.msg.arm_status != 0:
+            print(f"모터는 켜졌지만 arm_status={status.msg.arm_status} 표시는 남아 있습니다. 활성화와 오류 해제는 별개입니다.")
+            if status.msg.arm_status == 2:
+                print("NO_SOLUTION 복구 시도: python nero_recover.py --execute (현재 관절각을 목표로 전송)")
+        diagnostics.event(robot, "enabled")
         print("프로그램을 종료해도 모터는 활성화 상태로 남습니다.")
         return 0
     except (Exception, KeyboardInterrupt) as exc:
-        print("2단계 중단:", str(exc) or "사용자 중단")
-        if attempted:
-            try:
-                robot.electronic_emergency_stop()
-                print("전자 급정지 명령을 보냈습니다. 실제 정지 여부와 상태를 확인하세요.")
-            except Exception as stop_error:
-                print("전자 급정지 전송 실패:", stop_error)
-                print("장비의 물리 비상정지 절차를 따르세요.")
+        print("enable 확인 중단:", str(exc) or "사용자 중단")
+        if diagnostics is not None:
+            diagnostics.event(robot, "failed", error=str(exc) or "사용자 중단")
+        print("자동 reset/급정지/disable은 보내지 않았습니다. 일부 모터가 켜졌을 수 있으므로 표시 상태를 확인하세요.")
         return 1
     finally:
-        if robot is not None:
-            robot.disconnect()
+        try:
+            if robot is not None:
+                robot.disconnect()
+        finally:
+            if diagnostics is not None:
+                diagnostics.close()
 
 
 if __name__ == "__main__":

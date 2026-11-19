@@ -12,3 +12,8 @@ temp
 .pytest_cache/
 .venv/
 venv/
+data/nero_air/
+data/nero_teach/
+data/nero_teach_logs/
+data/nero_command_logs/
+data/nero_goto/
