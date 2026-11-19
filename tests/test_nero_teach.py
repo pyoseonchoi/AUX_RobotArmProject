@@ -5,6 +5,7 @@ import json
 import math
 from pathlib import Path
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -12,7 +13,7 @@ from unittest.mock import patch
 from pyAgxArm import ArmModel, create_agx_arm_config
 from nero_move_joint import move_joint_target
 from nero_read_status import FeedbackUnavailableError, feedback_time
-from nero_teach import (FORMAT, execute_path, leader_sample, load_teaching, main,
+from nero_teach import (FORMAT, TeachingFile, execute_path, leader_sample, load_teaching, main,
                         make_waypoints, prepare_joint_mode, record_hand, restore_control, wait_for_leader)
 from tests.slaves import _can_payloads as pl
 from tests.test_nero_move_to import CartesianSlave, VirtualRobotCase
@@ -38,6 +39,34 @@ class TeachingFileTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_sub_tick_samples_round_trip_with_high_resolution_elapsed_time(self):
+        with patch("nero_teach.time.monotonic", return_value=100.0), \
+             patch("nero_teach.time.perf_counter", side_effect=[100.0, 100.001, 100.004]):
+            writer = TeachingFile(Path(self.temp.name) / "record", {})
+            try:
+                writer.append([0.0] * 7, [1000.0] * 4)
+                writer.append([0.001] * 7, [1000.003] * 4)
+                writer.save("completed", True, "")
+            finally:
+                writer.close()
+        _, data = load_teaching(writer.directory, self.limits)
+        self.assertEqual(len(data["samples"]), 2)
+        self.assertGreater(data["samples"][1]["t_s"], data["samples"][0]["t_s"])
+
+    def test_nonadvancing_elapsed_clock_never_persists_duplicate_rows(self):
+        with patch("nero_teach.time.perf_counter", side_effect=[100.0, 100.01, 100.01, 100.005, 100.02]):
+            writer = TeachingFile(Path(self.temp.name) / "record", {})
+            try:
+                for index in range(4):
+                    writer.append([0.0] * 7, [1000.0 + index * 0.01] * 4)
+                writer.save("completed", True, "")
+            finally:
+                writer.close()
+        _, data = load_teaching(writer.directory, self.limits)
+        self.assertEqual(len(data["samples"]), 2)
+        with (writer.directory / "joints.csv").open(encoding="utf-8-sig") as stream:
+            self.assertEqual(len(list(csv.DictReader(stream))), 2)
 
     def test_file_units_model_and_completion_are_mandatory(self):
         for changes in (dict(status="recording"), dict(status="failed"),
@@ -72,10 +101,17 @@ class TeachingFileTests(unittest.TestCase):
         self.assertEqual(len(points), 2)
         self.assertEqual(len(samples), 5)
 
+    def test_large_span_is_accepted_by_default(self):
+        points, span = make_waypoints([sample(0, 0), sample(0.1, 150)])
+        self.assertAlmostEqual(span, 150)
+        self.assertEqual(points[-1], sample(0.1, 150)["q_rad"])
+        self.assertTrue(all(max(abs(x - y) for x, y in zip(a, b)) <= math.radians(2) + 1e-9
+                            for a, b in zip(points, points[1:])))
+
     def test_span_and_invalid_options_are_rejected(self):
         with self.assertRaises(ValueError):
-            make_waypoints([sample(0, 0), sample(0.1, 40)])
-        for kwargs in (dict(tolerance_degrees=float("nan")), dict(step_degrees=0), dict(max_span_degrees=-1)):
+            make_waypoints([sample(0, 0), sample(0.1, 40)], max_span_degrees=30)  # An explicit cap holds.
+        for kwargs in (dict(tolerance_degrees=float("nan")), dict(step_degrees=0), dict(max_span_degrees=-1), dict(max_span_degrees=361)):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 make_waypoints([sample(0, 0), sample(0.1, 1)], **kwargs)
 
@@ -237,6 +273,32 @@ class TeachingVirtualTests(VirtualRobotCase):
             leader_sample(self.robot)
         self.assertIn("leader_joint_34", str(raised.exception))
 
+    def test_record_follows_firmware_that_switches_from_normal_to_leader_packets(self):
+        # Replays 2026-11-19 13:18: mode 6 first on ordinary packets, then 0.3 s later
+        # leader packets only. The old recorder failed and left the arm in teaching mode.
+        self.device.emit_leader_packets = False
+        self.device.hand_motion = True
+        original = self.device._apply_host_command
+
+        def entry(aid, data):
+            original(aid, data)
+            if aid == 0x470 and data[0] == 0xFA:
+                def switch():
+                    self.device.emit_leader_packets = True
+                    self.device.leader_suppresses_normal = True
+                threading.Timer(0.3, switch).start()
+            if aid == 0x470 and data[0] == 0xFC:
+                self.device.leader_suppresses_normal = False
+
+        with patch.object(self.device, "_apply_host_command", side_effect=entry):
+            samples = record_hand(self.robot, self.directory, {}, duration=0.8)
+        _, data = load_teaching(self.directory, self.robot.get_config()["joint_limits"])  # No 0.5 s gap.
+        self.assertTrue(data["control_restored"])
+        self.assertEqual(data["source"], "normal_joint_packets_in_linkage_mode -> leader_packets")
+        self.assertEqual(len(data["source_switches"]), 1)
+        self.assertGreater(len(samples), 10)
+        self.assertEqual(int(self.robot.get_arm_status().msg.ctrl_mode), 1)
+
     def test_record_exits_real_leader_with_no_normal_feedback_until_follower(self):
         self.device.leader_suppresses_normal = True
         self.device.hand_motion = True
@@ -320,7 +382,8 @@ class TeachingVirtualTests(VirtualRobotCase):
         self.assertEqual(len(summary["completed_segments"]), 3)
         self.assertIsNone(summary["max_endpoint_error_mm"])
         self.assertLess(summary["max_joint_error_deg"], 0.01)
-        execute_path(self.robot, points, reverse=True, output_dir=Path(self.temp.name) / "runs")
+        execute_path(self.robot, points, reverse=True, return_path="recorded",
+                     output_dir=Path(self.temp.name) / "runs")
         values = [int.from_bytes(f.data[:4], "big", signed=True)
                   for f in self.device.host_frames if f.arbitration_id == 0x155]
         self.assertEqual(values, [0, 600, 1200, 1200, 600, 0])
@@ -339,12 +402,46 @@ class TeachingVirtualTests(VirtualRobotCase):
         for measured, expected in zip(actual, target):
             self.assertLess(abs(measured - expected), math.radians(0.002))
 
-    def test_replay_cycles_and_final_return_use_reverse_route(self):
+    def j1_targets(self):
+        return [int.from_bytes(f.data[:4], "big", signed=True)
+                for f in self.device.host_frames if f.arbitration_id == 0x155]
+
+    def test_replay_cycles_and_final_return_use_reverse_route_when_asked(self):
         points = [s["q_rad"] for s in (sample(0, 0), sample(0.1, 0.6))]
-        execute_path(self.robot, points, cycles=2, return_to_start=True, output_dir=self.temp.name)
-        values = [int.from_bytes(f.data[:4], "big", signed=True)
-                  for f in self.device.host_frames if f.arbitration_id == 0x155]
-        self.assertEqual(values, [0, 600, 600, 0, 0, 600, 600, 0])
+        execute_path(self.robot, points, cycles=2, return_to_start=True, return_path="recorded",
+                     output_dir=self.temp.name)
+        self.assertEqual(self.j1_targets(), [0, 600, 600, 0, 0, 600, 600, 0])
+
+    def test_replay_cycles_and_final_return_go_straight_back_by_default(self):
+        points = [s["q_rad"] for s in (sample(0, 0), sample(0.1, 0.6), sample(0.2, 1.2))]
+        run = execute_path(self.robot, points, cycles=2, return_to_start=True, output_dir=self.temp.name)
+        # Each return is one target back to the start, not the waypoints in reverse.
+        self.assertEqual(self.j1_targets(), [0, 600, 1200, 0, 0, 600, 1200, 0])
+        summary = json.loads((run / "summary.json").read_text(encoding="utf-8"))
+        phases = [s["phase"] for s in summary["completed_segments"] if s.get("direct")]
+        self.assertEqual(phases, ["cycle_return", "final_return"])
+
+    def test_direct_home_works_from_a_posture_off_the_recording(self):
+        points = [s["q_rad"] for s in (sample(0, 0), sample(0.1, 0.6), sample(0.2, 1.2))]
+        with self.device._state_lock:
+            self.device.current_joints = [math.radians(v) for v in (8, 3, 0, 0, 0, 0, 0)]
+            self.device._leader_rad = list(self.device.current_joints)
+        time.sleep(0.15)
+        execute_path(self.robot, points, reverse=True, output_dir=self.temp.name)
+        actual = list(self.robot.get_joint_angles().msg)
+        self.assertLess(max(abs(a - b) for a, b in zip(actual, points[0])), math.radians(0.11))
+        self.assertEqual(self.j1_targets()[-1], 0)
+        self.assertFalse(any(f.arbitration_id == 0x150 for f in self.device.host_frames))
+
+    def test_direct_return_that_dips_too_low_sends_nothing(self):
+        points = [s["q_rad"] for s in (sample(0, 0), sample(0.1, 0.6))]
+        with self.device._state_lock:
+            self.device.current_joints = [math.radians(v) for v in (3, 0, 0, 0, 0, 0, 0)]
+            self.device._leader_rad = list(self.device.current_joints)
+        time.sleep(0.15)
+        with self.assertRaisesRegex(RuntimeError, "recorded"):
+            execute_path(self.robot, points, reverse=True, min_z_mm=5000, output_dir=self.temp.name)
+        self.assertFalse(self.j1_targets())
 
     def test_recording_state_blocks_disabled_motors_before_leader_mode(self):
         with self.device._state_lock:

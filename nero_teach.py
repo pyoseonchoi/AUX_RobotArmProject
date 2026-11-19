@@ -12,7 +12,8 @@ import uuid
 
 from pyAgxArm import AgxArmFactory, ArmModel, create_agx_arm_config
 from nero_enable import DRIVER_ERROR_FIELDS
-from nero_move_joint import check_before_move, move_joint_target
+from nero_kinematics import joint_move_trace
+from nero_move_joint import check_before_move, motion_feedback, move_joint_target
 from nero_move_linear import flange_pose
 from nero_read_status import FeedbackUnavailableError, connect_nero, feedback_time, recent, require_feedback
 from nero_repeat_air import RunRecorder, observe
@@ -23,6 +24,10 @@ LEADER_PARTS = ("leader_joint_12", "leader_joint_34", "leader_joint_56", "leader
 NORMAL_PARTS = ("joint_12", "joint_34", "joint_56", "joint_7")
 RAD_KEYS = ["j{}_rad".format(i) for i in range(1, 8)]
 START_TOLERANCE = math.radians(0.5)
+MIN_WAYPOINT_DEG = 0.3  # Simplified points closer than this to the previous one are merged.
+DEFAULT_SPEED_PERCENT = 7  # Same default and upper bound as nero_goto.py / nero_home.py.
+MAX_SPEED_PERCENT = 20
+START_DELAY_S = 3.0  # Time to abort with Ctrl+C before a direct return starts.
 DIAGNOSTIC_ROOT = Path("data/nero_teach_logs")
 
 
@@ -174,6 +179,62 @@ def wait_for_teaching(robot, *, newer_than=None, timeout=3.0):
         if time.monotonic() >= deadline:
             raise FeedbackUnavailableError("교시 피드백을 확인하지 못했습니다: " + " / ".join(reasons))
         time.sleep(0.02)
+
+
+SOURCE_NAMES = {}  # Filled below: reader function -> name stored in the recording.
+
+
+class TeachingFeed:
+    """Teaching joint angles from whichever stream the firmware is sending now.
+
+    Leader packets are always preferred; ordinary joint packets are used only
+    while they still report linkage mode 6. On 2026-11-19 13:18 firmware 1.12
+    first answered the teaching request on the ordinary packets with mode 6,
+    then 0.5 s later stopped every ordinary joint, status and driver packet
+    (switching to leader packets, as on 2026-11-18). The recorder had locked
+    onto the ordinary packets, so both the recording and the exit to control
+    failed and the arm was left in teaching mode. Choosing per sample also
+    avoids a recording gap when the firmware switches.
+    """
+
+    MAX_SWITCH_JUMP = math.radians(10)  # Two streams disagreeing by more than this is not a switch.
+
+    def __init__(self):
+        self.active = None
+        self.last = None
+        self.switches = []
+        self.history = []  # Source names in the order they were used.
+
+    def __call__(self, robot, *, newer_than=None):
+        reasons = []
+        for reader in (leader_sample, linkage_sample):
+            try:
+                joints, stamps = reader(robot, newer_than=newer_than)
+            except FeedbackUnavailableError as exc:
+                reasons.append(str(exc))
+                continue
+            if self.active is not None and reader is not self.active:
+                if self.last is not None and joint_error(joints, self.last) > self.MAX_SWITCH_JUMP:
+                    raise RuntimeError("교시 데이터 출처가 바뀌는 순간 관절각이 10도 넘게 달라 기록을 중단합니다.")
+                self.switches.append(dict(at=feedback_time(), source=SOURCE_NAMES[reader]))
+                print("교시 데이터 출처가 바뀌었습니다:", SOURCE_NAMES[reader])
+            if reader is not self.active:
+                self.history.append(SOURCE_NAMES[reader])
+            self.active, self.last = reader, list(joints)
+            return joints, stamps
+        raise FeedbackUnavailableError("교시 피드백이 없습니다: " + " / ".join(reasons))
+
+    @property
+    def source(self):
+        return " -> ".join(self.history) if self.history else "unconfirmed"
+
+
+SOURCE_NAMES.update({leader_sample: "leader_packets", linkage_sample: "normal_joint_packets_in_linkage_mode"})
+
+
+def _may_lose_normal_feedback(reader):
+    """Leader firmware can suppress all ordinary packets; such readers must not need them."""
+    return reader is leader_sample or isinstance(reader, TeachingFeed)
 
 
 def wait_for_leader(robot, *, newer_than=None, timeout=3.0):
@@ -360,7 +421,7 @@ def restore_control(robot, *, on_sample=None, reader=None, motion_mode=None,
     try:
         normal_sample(robot)
     except FeedbackUnavailableError:
-        if reader is not leader_sample:
+        if not _may_lose_normal_feedback(reader):
             raise
     else:
         actual_enabled = _recovery_enable_state(robot)
@@ -371,7 +432,7 @@ def restore_control(robot, *, on_sample=None, reader=None, motion_mode=None,
     try:
         normal_sample(robot)
     except FeedbackUnavailableError:
-        if reader is not leader_sample:
+        if not _may_lose_normal_feedback(reader):
             raise
     else:
         actual_enabled = _recovery_enable_state(robot)
@@ -456,7 +517,7 @@ class TeachingFile:
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=False)
         self.metadata, self.samples = metadata, []
-        self.started = time.monotonic()
+        self.started = time.perf_counter()
         self.previous = None
         self.stream = (self.directory / "joints.csv").open("w", encoding="utf-8-sig", newline="")
         self.writer = csv.writer(self.stream)
@@ -473,7 +534,12 @@ class TeachingFile:
     def append(self, joints, stamps):
         if self.previous is not None and not all(a > b for a, b in zip(stamps, self.previous)):
             return
-        elapsed = time.monotonic() - self.started
+        # On Windows/Python 3.12 monotonic() can tick coarsely enough that
+        # the first two fresh CAN samples both get t_s=0. Use the high-resolution
+        # counter, and never persist a duplicate/backward elapsed timestamp.
+        elapsed = time.perf_counter() - self.started
+        if elapsed < 0 or (self.samples and elapsed <= self.samples[-1]["t_s"]):
+            return
         sample = dict(t_s=elapsed, q_rad=list(joints), component_epoch_s=list(stamps))
         self.writer.writerow([elapsed, feedback_time()] + list(joints)
                              + [math.degrees(x) for x in joints] + list(stamps))
@@ -497,7 +563,7 @@ def record_hand(robot, directory, metadata, duration=10.0, hz=20):
     if int(robot.get_arm_status().msg.arm_status) == 2:
         raise RuntimeError(
             "이전 NO_SOLUTION이 남아 있습니다. 교시 모드로 전환하지 않았습니다. "
-            "python nero_recover.py --execute로 현재 관절각 목표를 보내 복구를 시도하고, "
+            "python nero_recover.py --execute로 복구를 시도하고(직선 목표로 표시를 지움), "
             "NORMAL 확인 후 다시 기록하세요.")
     _diagnose(robot, "record_before_entry", directory=str(Path(directory).resolve()))
     reported_mode = robot.get_arm_status().msg.mode_feedback
@@ -512,14 +578,16 @@ def record_hand(robot, directory, metadata, duration=10.0, hz=20):
                                           pre_teach_joints_rad=initial,
                                           pre_teach_motion_mode=initial_mode))
     entered = restored = False
-    reader = None
+    reader = TeachingFeed()
     status, reason, caught = "completed", "", None
     try:
         print("팔과 도구를 지지하세요. 손 유도 모드로 전환합니다. disable은 보내지 않습니다.")
         entered_at = feedback_time()
         entered = True  # Even partial transmission requires explicit cleanup.
         request_teaching_mode(robot)
-        reader, source, joints, stamps = wait_for_teaching(robot, newer_than=entered_at)
+        _, source, joints, stamps = wait_for_teaching(robot, newer_than=entered_at)
+        reader.active = leader_sample if source == "leader_packets" else linkage_sample
+        reader.last, reader.history = list(joints), [source]
         writer.metadata["source"] = source
         writer.metadata["mode_confirmation"] = ("fresh leader packets" if source == "leader_packets"
                                                 else "fresh normal packets and ctrl_mode=6; not a torque measurement")
@@ -527,7 +595,7 @@ def record_hand(robot, directory, metadata, duration=10.0, hz=20):
         print("교시 기록 데이터:", source)
         if joint_error(initial, joints) > math.radians(1):
             raise RuntimeError("교시 모드 진입 중 자세가 1도 넘게 바뀌었습니다. 지지 상태를 확인하세요.")
-        writer.started = time.monotonic()
+        writer.started = time.perf_counter()
         writer.append(joints, stamps)
         print("기록 시작: {:.1f}초 동안 공중에서 천천히 움직이세요.".format(duration))
         deadline = time.monotonic() + duration
@@ -545,8 +613,11 @@ def record_hand(robot, directory, metadata, duration=10.0, hz=20):
             try:
                 # On failed recording do not extend the damaged file, but still
                 # attempt a stationary, feedback-verified exit from hand guidance.
+                # No confirmed teaching stream (entry rejected or never seen):
+                # let restore_control pick leader or ordinary packets itself.
                 final_joints = restore_control(robot, on_sample=writer.append if caught is None else None,
-                                               reader=reader, motion_mode=initial_mode,
+                                               reader=reader if reader.active is not None else None,
+                                               motion_mode=initial_mode,
                                                expected_enabled=(True,) * 7)
                 restored = True
                 if caught is None and writer.samples and joint_error(final_joints, writer.samples[-1]["q_rad"]) > START_TOLERANCE:
@@ -557,6 +628,9 @@ def record_hand(robot, directory, metadata, duration=10.0, hz=20):
                 if caught is None:
                     caught = exc
                 print("교시 모드가 남아 있을 수 있습니다. 팔을 지지하고 control --execute로 확인하세요.")
+        if reader.switches:
+            writer.metadata["source"] = reader.source
+            writer.metadata["source_switches"] = reader.switches
         try:
             writer.save(status, restored, reason)
         finally:
@@ -582,30 +656,32 @@ def load_teaching(path, limits):
     if not isinstance(samples, list) or not 2 <= len(samples) <= 10000:
         raise ValueError("교시 샘플이 2~10000개 필요합니다.")
     previous = None
-    for sample in samples:
+    for index, sample in enumerate(samples):
         stamp = sample.get("t_s")
         if not isinstance(stamp, (int, float)) or isinstance(stamp, bool) or not math.isfinite(stamp) or stamp < 0:
             raise ValueError("샘플 경과 시간이 유효하지 않습니다.")
         if previous is not None and not 0 < stamp - previous < 0.5:
-            raise ValueError("시간 역전·중복 또는 0.5초 이상 기록 공백이 있습니다.")
+            raise ValueError("샘플 {}→{}의 시간 간격이 {:.6f}초입니다. "
+                             "시간 역전·중복 또는 0.5초 이상 기록 공백이 있습니다.".format(
+                                 index - 1, index, stamp - previous))
         validate_joints(sample.get("q_rad", []), limits)
         previous = stamp
     return path, data
 
 
-def make_waypoints(samples, tolerance_degrees=0.1, step_degrees=2.0, max_span_degrees=30.0):
+def make_waypoints(samples, tolerance_degrees=0.1, step_degrees=2.0, max_span_degrees=360.0):
     """Simplify against time-parametrized joint lines, then bound every step."""
     if not math.isfinite(tolerance_degrees) or not 0.01 <= tolerance_degrees <= 0.5:
         raise ValueError("경로 단순화 허용 오차는 0.01~0.5도입니다.")
     if not math.isfinite(step_degrees) or not 0.2 <= step_degrees <= 4:
         raise ValueError("웨이포인트 간격은 0.2~4도입니다.")
-    if not math.isfinite(max_span_degrees) or not 0 < max_span_degrees <= 90:
-        raise ValueError("관절별 전체 움직임 범위 한도는 0보다 크고 90도 이하여야 합니다.")
+    if not math.isfinite(max_span_degrees) or not 0 < max_span_degrees <= 360:
+        raise ValueError("관절별 전체 움직임 범위 한도는 0보다 크고 360도 이하여야 합니다.")
     span = max(max(s["q_rad"][i] for s in samples) - min(s["q_rad"][i] for s in samples) for i in range(7))
     if span > math.radians(max_span_degrees):
         raise ValueError(
             "기록의 관절별 움직임 범위가 {:.3f}도로 소프트웨어 한도 {:.1f}도를 넘습니다. "
-            "범위는 기록 중 관절별 최댓값-최솟값입니다. --max-span-deg로 명시적으로 늘릴 수 있습니다(최대 90도). "
+            "범위는 기록 중 관절별 최댓값-최솟값입니다. --max-span-deg로 늘리거나 빼세요(최대 360도). "
             "SDK 관절 제한과 웨이포인트 간격 제한은 그대로 적용됩니다.".format(math.degrees(span), max_span_degrees))
     keep = {0, len(samples) - 1}
     stack = [(0, len(samples) - 1)]
@@ -624,7 +700,15 @@ def make_waypoints(samples, tolerance_degrees=0.1, step_degrees=2.0, max_span_de
         if largest > math.radians(tolerance_degrees):
             keep.add(split)
             stack.extend(((lo, split), (split, hi)))
-    selected = [samples[i]["q_rad"] for i in sorted(keep)]
+    # Drop kept points that barely differ from the previous one: each waypoint
+    # costs about 0.85 s. On teach_test02 (2026-11-18) this removed 7 of 208
+    # waypoints and kept every recorded sample within 0.1 degree of the path.
+    kept = sorted(keep)
+    selected = [samples[kept[0]]["q_rad"]]
+    for index in kept[1:-1]:
+        if joint_error(samples[index]["q_rad"], selected[-1]) >= math.radians(MIN_WAYPOINT_DEG):
+            selected.append(samples[index]["q_rad"])
+    selected.append(samples[kept[-1]]["q_rad"])
     points = [list(selected[0])]
     for target in selected[1:]:
         start = points[-1]
@@ -635,23 +719,65 @@ def make_waypoints(samples, tolerance_degrees=0.1, step_degrees=2.0, max_span_de
     return points, math.degrees(span)
 
 
+def move_to_start(robot, start, *, speed_percent=5, timeout=30.0, min_z_mm=50.0, start_delay=0.0, check=None):
+    """One joint move straight to the recording's first posture; all joints arrive together.
+
+    The default way back since 2026-11-18. Retracing the recording took about
+    0.85 s per waypoint (teach_test02: 201 waypoints, about 3 minutes) and could
+    stall on a single unapplied frame; this is one move of a few seconds.
+    The path differs from the recorded one, so the arm sweeps through space the
+    hand did not visit: it is only checked for joint limits and for elbow,
+    wrist and flange staying above ``min_z_mm``. No collision check.
+    """
+    current = motion_feedback(robot)[0]
+    travel = math.degrees(joint_error(current, start))
+    path_mm, lowest_mm = joint_move_trace(current, start, together=True)
+    print("시작 자세로 바로 이동: 가장 많이 도는 관절 {:.1f}도 / 플랜지 이동 약 {:.0f}mm / "
+          "팔꿈치·손목·플랜지 최저 높이 {:.0f}mm (한도 {:g}mm)".format(travel, path_mm, lowest_mm, min_z_mm))
+    if lowest_mm < min_z_mm:
+        raise RuntimeError("시작 자세로 바로 가면 높이 {:.0f}mm까지 내려갑니다 (한도 {:g}mm). "
+                           "--return-path recorded로 기록을 거꾸로 따라가세요.".format(lowest_mm, min_z_mm))
+    if travel > 90:
+        print("큰 관절 이동입니다. 팔 전체가 넓게 휘돌아 가므로 주변 공간을 확인하세요.")
+    if start_delay > 0:
+        print("{:g}초 후 이동을 시작합니다. 중단하려면 Ctrl+C.".format(start_delay))
+        time.sleep(start_delay)
+    return move_joint_target(robot, start, timeout=timeout, max_step_degrees=360.0, allow_long_move=True,
+                             lead_degrees=max(2.0, 0.3 * speed_percent), speed_percent=speed_percent,
+                             on_feedback=check)
+
+
 def execute_path(robot, points, *, reverse=False, cycles=1, return_to_start=False,
-                 timeout=30.0, step_degrees=2.0, output_dir="data/nero_teach/runs", source=""):
+                 timeout=30.0, step_degrees=2.0, output_dir="data/nero_teach/runs", source="",
+                 return_path="direct", speed_percent=5, min_z_mm=50.0, start_delay=0.0):
+    """Replay ``points`` (or, with ``reverse``, return to their start).
+
+    ``return_path``: "direct" goes back to the first posture with one joint
+    move (move_to_start); "recorded" retraces the recording waypoint by
+    waypoint, a path the hand already showed to be clear. It applies to the
+    home command, the return between cycles and the final return.
+    """
+    if return_path not in ("direct", "recorded"):
+        raise ValueError("복귀 방식은 direct 또는 recorded입니다.")
     current = check_before_move(robot)
     route = list(reversed(points)) if reverse else list(points)
     if reverse and joint_error(current, points[0]) <= math.radians(0.1):
         print("이미 기록의 시작 자세에 있습니다. 복귀 이동을 보내지 않습니다.")
         return None
-    if joint_error(current, route[0]) > START_TOLERANCE:
-        raise RuntimeError("현재 자세가 기록의 {} 자세에서 0.5도 넘게 벗어났습니다. 임의 연결 이동은 하지 않습니다.".format(
-            "끝" if reverse else "시작"))
+    direct_home = reverse and return_path == "direct"
+    if not direct_home and joint_error(current, route[0]) > START_TOLERANCE:
+        raise RuntimeError("현재 자세가 기록의 {} 자세에서 0.5도 넘게 벗어났습니다. 임의 연결 이동은 하지 않습니다.{}".format(
+            "끝" if reverse else "시작",
+            " 기본 복귀 방식(direct)은 어느 자세에서든 시작 자세로 갑니다." if reverse else
+            " 먼저 python nero_teach.py home <기록> --execute로 시작 자세로 돌아가세요."))
+    way_back = None if return_path == "direct" else list(reversed(points))  # None: one direct joint move.
     run_id = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:8]
     recorder = RunRecorder(robot, Path(output_dir) / run_id,
                            dict(schema_version=1, created_at=datetime.now().astimezone().isoformat(),
                                 mode="teach_home" if reverse else "teach_replay", source=str(source),
                                 coordinate_frame="robot_base", control_point="flange",
                                 units="CSV: mm, deg, s; waypoints: rad",
-                                waypoints_rad=route, speed_percent=5,
+                                waypoints_rad=route, speed_percent=speed_percent, return_path=return_path,
                                 notes="Joint waypoint replay; original timing and contact force are not reproduced."),
                            enforce_motion_state=True)
     result, reason = "completed", ""
@@ -659,19 +785,31 @@ def execute_path(robot, points, *, reverse=False, cycles=1, return_to_start=Fals
         recorder.start()
         observe(recorder, 0.2)
         for cycle in range(1, cycles + 1):
-            legs = [("home" if reverse else "replay", route)]
+            legs = [("home", way_back if reverse else None)] if reverse else [("replay", route)]
             if cycle > 1:
-                legs.insert(0, ("cycle_return", list(reversed(route))))
+                legs.insert(0, ("cycle_return", way_back))
             if return_to_start and cycle == cycles and not reverse:
-                legs.append(("final_return", list(reversed(route))))
+                legs.append(("final_return", way_back))
             for phase, leg in legs:
+                if leg is None:  # Direct return: one joint move to the first posture.
+                    recorder.set_phase(cycle, phase)
+                    recorder.event("waypoint_requested", index=0, target_rad=points[0], direct=True)
+                    print("{} (시작 자세로 바로 이동) / 실행 {}/{}".format(phase, cycle, cycles))
+                    actual = move_to_start(robot, points[0], speed_percent=speed_percent, timeout=timeout,
+                                           min_z_mm=min_z_mm, check=recorder.check,
+                                           start_delay=start_delay if phase == "home" else 0.0)
+                    recorder.segments.append(dict(cycle=cycle, phase=phase, index=0, direct=True,
+                        target_rad=points[0], actual_rad=actual, endpoint_error_mm=None,
+                        max_joint_error_deg=math.degrees(joint_error(actual, points[0]))))
+                    recorder.event("waypoint_completed", **recorder.segments[-1])
+                    continue
                 for index, target in enumerate(leg):
                     recorder.set_phase(cycle, phase)
                     recorder.event("waypoint_requested", index=index, target_rad=target)
                     print("{} {}/{} / 실행 {}/{}".format(phase, index + 1, len(leg), cycle, cycles))
                     actual = move_joint_target(robot, target, timeout=timeout,
                                                max_step_degrees=step_degrees + 0.5,
-                                               on_feedback=recorder.check)
+                                               on_feedback=recorder.check, speed_percent=speed_percent)
                     recorder.segments.append(dict(cycle=cycle, phase=phase, index=index,
                         target_rad=target, actual_rad=actual, endpoint_error_mm=None,
                         max_joint_error_deg=math.degrees(joint_error(actual, target))))
@@ -695,10 +833,10 @@ def get_parser():
     record.add_argument("--output", help="새 기록 폴더. 기존 폴더는 덮어쓰지 않음")
     record.add_argument("--duration", type=float, default=10, help="기록 시간(초), 1~120")
     record.add_argument("--sample-hz", type=float, default=20, help="기록 폴링 목표 Hz, 5~50")
-    record.add_argument("--return-to-start", action="store_true", help="기록/제어 복귀 후 역방향 경로로 시작점 복귀")
+    record.add_argument("--return-to-start", action="store_true", help="기록/제어 복귀 후 시작 자세로 복귀")
     for name in ("inspect", "home", "replay"):
         sub = commands.add_parser(name, help={"inspect": "파일/경로 검토 (오프라인)",
-            "home": "기록의 역방향 경로로 시작 자세 복귀", "replay": "기록한 관절 경로 재생"}[name])
+            "home": "기록의 시작 자세로 복귀 (기본: 관절 이동 한 번)", "replay": "기록한 관절 경로 재생"}[name])
         sub.add_argument("path", help="기록 폴더 또는 trajectory.json")
     control = commands.add_parser("control", help="관측 재개 및 정지 확인 후 제어 모드로 복귀")
     control.add_argument("--firmware", choices=("v112", "v120", "v121"),
@@ -709,10 +847,18 @@ def get_parser():
         sub.add_argument("--channel", default="0")
         sub.add_argument("--simplify-deg", type=float, default=0.1)
         sub.add_argument("--step-deg", type=float, default=2.0)
-        sub.add_argument("--max-span-deg", type=float, default=30.0)
+        sub.add_argument("--max-span-deg", type=float, default=360.0,
+                         help="기록 중 관절별 움직임 범위 한도(도), 0~360. 기본 360(사실상 제한 없음)")
         sub.add_argument("--timeout", type=float, default=30)
+        sub.add_argument("--return-path", choices=("direct", "recorded"), default="direct",
+                         help="시작 자세로 돌아가는 방식. direct(기본): 관절 이동 한 번 / "
+                              "recorded: 기록을 거꾸로 따라감(손으로 지나간 길, 느림)")
+        sub.add_argument("--speed", type=int, default=DEFAULT_SPEED_PERCENT,
+                         help="속도 비율(%%), 1~{}. 기본 {}".format(MAX_SPEED_PERCENT, DEFAULT_SPEED_PERCENT))
+        sub.add_argument("--min-z-mm", type=float, default=50.0,
+                         help="direct 복귀 중 팔꿈치·손목·플랜지 최저 허용 높이(mm). 기본 50. 충돌 검사는 아님")
     replay = commands.choices["replay"]
-    replay.add_argument("--cycles", type=int, default=1, help="재생 횟수, 1~10. 사이에는 역경로로 복귀")
+    replay.add_argument("--cycles", type=int, default=1, help="재생 횟수, 1~10. 사이에는 시작 자세로 복귀")
     replay.add_argument("--return-to-start", action="store_true", help="마지막 재생 후에도 시작 자세로 복귀")
     return parser
 
@@ -730,6 +876,10 @@ def main():
             raise ValueError("timeout은 0보다 큰 유한한 초 값이어야 합니다.")
         if not 1 <= getattr(args, "cycles", 1) <= 10:
             raise ValueError("재생 횟수는 1~10입니다.")
+        if not 1 <= args.speed <= MAX_SPEED_PERCENT:
+            raise ValueError("속도 비율은 1~{}%입니다.".format(MAX_SPEED_PERCENT))
+        if not math.isfinite(args.min_z_mm):
+            raise ValueError("최저 높이는 유한한 mm 값이어야 합니다.")
         make_waypoints([dict(t_s=0, q_rad=[0.0] * 7), dict(t_s=0.1, q_rad=[0.0] * 7)],
                        args.simplify_deg, args.step_deg, args.max_span_deg)
         if args.command == "record":
@@ -748,8 +898,12 @@ def main():
             path, data = load_teaching(args.path, limits)
             points, span = make_waypoints(data["samples"], args.simplify_deg, args.step_deg, args.max_span_deg)
             print("원본 {}개 → 재생 {}개 / 최대 관절별 범위 {:.3f}도".format(len(data["samples"]), len(points), span))
-            print("기록 시간 {:.3f}초. 재생은 5% 속도의 관절 경로 근사이며 원래 시간/힘을 재현하지 않습니다.".format(
-                data["samples"][-1]["t_s"] - data["samples"][0]["t_s"]))
+            print("기록 시간 {:.3f}초. 재생은 {}% 속도의 관절 경로 근사이며 원래 시간/힘을 재현하지 않습니다.".format(
+                data["samples"][-1]["t_s"] - data["samples"][0]["t_s"], args.speed))
+            if args.command in ("home", "replay"):
+                print("시작 자세로 돌아가는 방식: {}".format(
+                    "관절 이동 한 번 (direct, 거리·최저 높이는 실행 시 현재 자세에서 계산)"
+                    if args.return_path == "direct" else "기록을 거꾸로 따라감 (recorded)"))
             print("시작 관절각(deg):", [round(math.degrees(x), 3) for x in points[0]])
             print("끝 관절각(deg):", [round(math.degrees(x), 3) for x in points[-1]])
             if args.command == "inspect" or not args.execute:
@@ -786,10 +940,11 @@ def main():
             if args.return_to_start:
                 path, data = load_teaching(directory, robot.get_config()["joint_limits"])
                 points, _ = make_waypoints(data["samples"], args.simplify_deg, args.step_deg, args.max_span_deg)
-                print("3초 후 기록의 역경로로 복귀합니다. 팔에서 손을 떼고 이동 공간을 비우세요.")
+                print("3초 후 시작 자세로 복귀합니다({}). 팔에서 손을 떼고 이동 공간을 비우세요.".format(args.return_path))
                 time.sleep(3)
                 execute_path(robot, points, reverse=True, timeout=args.timeout,
-                             step_degrees=args.step_deg, source=path)
+                             step_degrees=args.step_deg, source=path, return_path=args.return_path,
+                             speed_percent=args.speed, min_z_mm=args.min_z_mm)
         elif args.command == "control":
             # Normal telemetry alone does not prove the role is follower. An
             # explicit control request observes a stop then requests follower.
@@ -802,7 +957,9 @@ def main():
             execute_path(robot, points, reverse=args.command == "home",
                          cycles=getattr(args, "cycles", 1),
                          return_to_start=getattr(args, "return_to_start", False),
-                         timeout=args.timeout, step_degrees=args.step_deg, source=path)
+                         timeout=args.timeout, step_degrees=args.step_deg, source=path,
+                         return_path=args.return_path, speed_percent=args.speed, min_z_mm=args.min_z_mm,
+                         start_delay=START_DELAY_S if args.command == "home" else 0.0)
         _diagnose(robot, "completed")
         return 0
     except (Exception, KeyboardInterrupt) as exc:
