@@ -6,10 +6,10 @@
 
 ## 준비
 
-계획 계산에 numpy를 사용합니다. 현재 `.venv`에는 설치해 두었고, 환경을 새로 만들면 다시 설치합니다.
+계획 계산에 NumPy를 사용합니다. 새 환경에서는 공통 의존성 목록으로 설치합니다. Python 3.6에서는 `dataclasses` 호환 패키지도 함께 설치됩니다. home과 teach도 같은 목록을 사용합니다.
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install numpy
+.\.venv\Scripts\python.exe -m pip install -r requirements-nero.txt
 ```
 
 ## 사용법
