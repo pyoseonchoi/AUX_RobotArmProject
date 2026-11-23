@@ -12,6 +12,7 @@ from unittest.mock import patch
 from nero_goto import LineMonitor, main
 from nero_kinematics import forward, plan_joint_move, plan_line, pose6
 from nero_move_linear import move_linear_target
+from tests.conftest import numeric_enum_format
 from tests.test_nero_move_to import VirtualRobotCase
 from tests.test_nero_teach import TeachingSlave
 
@@ -203,7 +204,8 @@ class GotoVirtualTests(GotoCase):
                 self.device.reported_arm_status = 2
                 return
             original(aid, data)
-        with patch.object(self.device, "_apply_host_command", side_effect=reject):
+        with patch.object(self.device, "_apply_host_command", side_effect=reject), \
+             patch.object(type(self.robot.get_arm_status().msg.arm_status), "__format__", numeric_enum_format):
             self.assertEqual(self.run_goto(*NEAR, "--execute"), 1)
         log, = Path(self.temp.name).glob("*.jsonl")
         events = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]

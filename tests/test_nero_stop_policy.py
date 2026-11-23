@@ -15,6 +15,7 @@ from nero_move_joint import (ControllerRejected, ProgressTimeout, RejectionWatch
 from nero_move_linear import move_linear_target
 from nero_read_status import FeedbackUnavailableError
 from nero_repeat_air import read_sample
+from tests.conftest import numeric_enum_format
 from tests.test_nero_move_to import VirtualRobotCase
 from tests.test_nero_teach import TeachingSlave
 
@@ -97,7 +98,8 @@ class StopPolicyTests(VirtualRobotCase):
 
     def test_refused_line_with_still_arm_skips_the_stop(self):
         self.device.reject_poses = True
-        with self.assertRaisesRegex(ControllerRejected, "NO_SOLUTION"):
+        with patch.object(type(self.robot.get_arm_status().msg.arm_status), "__format__", numeric_enum_format), \
+             self.assertRaisesRegex(ControllerRejected, "NO_SOLUTION"):
             move_linear_target(self.robot, self.line_target(), timeout=5)
         time.sleep(0.1)
         self.assertFalse(self.stops())

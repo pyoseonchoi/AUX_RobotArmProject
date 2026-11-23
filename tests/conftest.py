@@ -2,6 +2,11 @@ import time
 import uuid
 
 
+def numeric_enum_format(value, format_spec):
+    """Emulate Python 3.6/3.7 IntEnum formatting that bypasses __str__."""
+    return format(int(value), format_spec)
+
+
 def new_virtual_channel(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
 

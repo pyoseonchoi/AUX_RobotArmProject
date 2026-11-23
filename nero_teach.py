@@ -391,7 +391,7 @@ def wait_for_can_control(robot, reference, *, newer_than, expected_enabled,
                 acknowledged_at, previous_stamps, acknowledged_samples = None, None, 0
             if ctrl not in (1, 6):
                 raise RuntimeError("제어 복귀 중 예상하지 못한 제어 모드: {}".format(status.msg.ctrl_mode))
-            last_reason = "ctrl_mode={} / arm_status={} / mode_feedback={}".format(
+            last_reason = "ctrl_mode={!s} / arm_status={!s} / mode_feedback={!s}".format(
                 status.msg.ctrl_mode, status.msg.arm_status, status.msg.mode_feedback)
         except FeedbackUnavailableError as exc:
             acknowledged_at, previous_stamps, acknowledged_samples = None, None, 0
@@ -570,7 +570,7 @@ def record_hand(robot, directory, metadata, duration=10.0, hz=20):
     initial_mode = int(reported_mode)
     if initial_mode not in (0, 1, 2, 3):
         raise RuntimeError(
-            "교시 진입 전 이동 모드가 P/J/L/C가 아닙니다: mode_feedback={} (값 {}). "
+            "교시 진입 전 이동 모드가 P/J/L/C가 아닙니다: mode_feedback={!s} (값 {}). "
             "교시 요청/기록은 시작하지 않았습니다. MIT/CPV를 자동 전환하지 않습니다. "
             "팔을 지지하고 disable → prepare --execute → enable 후 상태를 확인하세요.".format(reported_mode, initial_mode))
     initial_pose, _ = flange_pose(robot)

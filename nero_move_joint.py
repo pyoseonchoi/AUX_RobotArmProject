@@ -86,12 +86,12 @@ class RejectionWatch:
             return
         if not self.leftover:
             self.gave_up = True
-            raise ControllerRejected("컨트롤러가 이 목표의 경로를 거부했습니다: {}. "
+            raise ControllerRejected("컨트롤러가 이 목표의 경로를 거부했습니다: {!s}. "
                                      "목표나 방향을 바꿔 다시 시도하세요.".format(status.msg.arm_status))
         moved = max(abs(a - b) for a, b in zip(angles, self.start))
         if time.monotonic() - self.sent >= self.STALL_S and moved < math.radians(0.05):
             self.gave_up = True
-            raise ControllerRejected("이전 경로 거부 표시({})가 새 목표를 보낸 뒤에도 남아 있고 "
+            raise ControllerRejected("이전 경로 거부 표시({!s})가 새 목표를 보낸 뒤에도 남아 있고 "
                                      "팔이 움직이지 않습니다.".format(status.msg.arm_status))
 
     def controller_gave_up(self):

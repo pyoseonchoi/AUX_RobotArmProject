@@ -18,6 +18,7 @@ from nero_read_status import FeedbackUnavailableError, feedback_time
 from nero_teach import (FORMAT, TeachingFile, execute_path, leader_sample, load_teaching, main,
                         make_waypoints, prepare_joint_mode, record_hand, restore_control, wait_for_leader)
 from tests.slaves import _can_payloads as pl
+from tests.conftest import numeric_enum_format
 from tests.test_nero_move_to import CartesianSlave, VirtualRobotCase
 
 
@@ -484,7 +485,8 @@ class TeachingVirtualTests(VirtualRobotCase):
         with self.device._state_lock:
             self.device._mode_feedback = 6
         time.sleep(0.08)
-        with self.assertRaisesRegex(RuntimeError, "MOVE_MIT.*값 6"):
+        with patch.object(type(self.robot.get_arm_status().msg.mode_feedback), "__format__", numeric_enum_format), \
+             self.assertRaisesRegex(RuntimeError, "MOVE_MIT.*값 6"):
             record_hand(self.robot, self.directory, {}, duration=0.1)
         self.assertFalse(self.device.host_frames)
         self.assertFalse(self.directory.exists())
@@ -520,7 +522,8 @@ class TeachingVirtualTests(VirtualRobotCase):
             self.device._joints_enabled = [False] * 7
             self.device.ignore_motion_change = True
         time.sleep(0.08)
-        with self.assertRaisesRegex(FeedbackUnavailableError, "mode_feedback=MOVE_MIT"):
+        with patch.object(type(self.robot.get_arm_status().msg.mode_feedback), "__format__", numeric_enum_format), \
+             self.assertRaisesRegex(FeedbackUnavailableError, "mode_feedback=MOVE_MIT"):
             prepare_joint_mode(self.robot, timeout=0.2)
         self.assertTrue(all(f.arbitration_id == 0x151 for f in self.device.host_frames))
 
