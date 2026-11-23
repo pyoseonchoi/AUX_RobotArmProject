@@ -7,6 +7,8 @@ import math
 from pathlib import Path
 import time
 
+import numpy as np
+
 from nero_diagnostics import SessionDiagnostics
 from nero_kinematics import height_floor_mm, height_limit_text, joint_move_trace
 from nero_move_joint import move_joint_target
@@ -60,7 +62,7 @@ def capture_home(robot, version, profile, timeout=3.0):
         lows = [min(a, b) for a, b in zip(lows, angles)]
         highs = [max(a, b) for a, b in zip(highs, angles)]
         if (max(h - l for l, h in zip(lows, highs)) > math.radians(0.05)
-                or math.dist(first_pose[:3], pose[:3]) > 0.0005
+                or np.linalg.norm(np.subtract(first_pose[:3], pose[:3])) > 0.0005
                 or orientation_error(first_pose, pose) > math.radians(0.1)):
             raise RuntimeError("자세가 변하고 있어 초기화 위치를 저장하지 않습니다. 팔을 멈춘 뒤 다시 조회하세요.")
         samples += 1
@@ -122,7 +124,7 @@ def return_home(robot, home, *, timeout=60.0, max_joint_move_deg=360.0, speed_pe
     target = home["joints_rad"]
     angles, pose = read_posture(robot)
     if (max(abs(a - b) for a, b in zip(angles, target)) < math.radians(0.1)
-            and math.dist(pose[:3], home["flange_pose_m_rad"][:3]) < 0.002
+            and np.linalg.norm(np.subtract(pose[:3], home["flange_pose_m_rad"][:3])) < 0.002
             and orientation_error(pose, home["flange_pose_m_rad"]) < math.radians(1)):
         print("이미 초기화 위치·자세입니다. 이동 명령을 보내지 않습니다.")
         return
@@ -130,7 +132,7 @@ def return_home(robot, home, *, timeout=60.0, max_joint_move_deg=360.0, speed_pe
     move_joint_target(robot, target, timeout=timeout, max_step_degrees=max_joint_move_deg,
                       speed_percent=speed_percent, allow_long_move=True, lead_degrees=2.0)
     _, pose = read_posture(robot)
-    error_mm = math.dist(pose[:3], home["flange_pose_m_rad"][:3]) * 1000
+    error_mm = float(np.linalg.norm(np.subtract(pose[:3], home["flange_pose_m_rad"][:3]))) * 1000
     if error_mm >= 2 or orientation_error(pose, home["flange_pose_m_rad"]) >= math.radians(1):
         raise RuntimeError(f"관절 목표에는 도달했지만 저장한 플랜지 자세와 다릅니다 (위치 오차 {error_mm:.3f}mm).")
     print(f"초기화 위치 복귀 완료. XYZ 오차 {error_mm:.3f}mm.")

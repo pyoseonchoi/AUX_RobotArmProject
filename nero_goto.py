@@ -206,7 +206,7 @@ def execute_plan(robot, plan, *, speed_percent=5, timeout=60.0, max_deviation_mm
     if len(plan.line_joints) < 2:
         return result
     start, _ = flange_pose(robot)
-    gap_mm = math.dist(start[:3], plan.entry_pose[:3]) * 1000.0
+    gap_mm = float(np.linalg.norm(np.subtract(start[:3], plan.entry_pose[:3]))) * 1000.0
     if gap_mm > ENTRY_TOLERANCE_MM:
         raise RuntimeError("직선 시작점이 계획과 {:.1f}mm 다릅니다 (허용 {:g}mm). 직선 이동을 보내지 않습니다.".format(
             gap_mm, ENTRY_TOLERANCE_MM))
@@ -225,7 +225,7 @@ def execute_plan(robot, plan, *, speed_percent=5, timeout=60.0, max_deviation_mm
     actual = move_linear_target(robot, plan.target_pose, timeout=timeout, on_feedback=monitor,
                                 speed_percent=speed_percent, settled=plan.needs_joint_move)
     result.update(max_line_deviation_mm=monitor.worst_mm,
-                  endpoint_error_mm=math.dist(actual[:3], plan.target_pose[:3]) * 1000.0)
+                  endpoint_error_mm=float(np.linalg.norm(np.subtract(actual[:3], plan.target_pose[:3]))) * 1000.0)
     if recorder is not None:
         recorder.segments.append(dict(cycle=1, phase="line", actual_m_rad=actual,
                                       target_m_rad=plan.target_pose, **result))
