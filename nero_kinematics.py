@@ -488,9 +488,29 @@ def _joint_move_trace(start, end, together):
 def joint_move_trace(start_joints, end_joints, together=True):
     """(flange path length mm, lowest elbow/wrist/flange origin mm) of a joint move.
 
-    For moves that do not go through plan_line, such as nero_home.py.
+    For moves that do not go through plan_line, such as nero_home.py. The
+    lowest point includes the start posture; see height_floor_mm.
     """
     return _joint_move_trace(_joints(start_joints), _joints(end_joints), together)
+
+
+def height_floor_mm(start_joints, min_z_mm):
+    """Lowest height (mm) a move from ``start_joints`` may reach.
+
+    ``min_z_mm``, unless the arm already starts lower: then it may not go below
+    where it is now (1 mm of slack). On 2026-11-23 a return home that only rose
+    from a flange 34 mm above the base plane was refused, because the start
+    itself counted as going below the 50 mm limit.
+    """
+    return min(min_z_mm, _lowest_origin_mm(_joints(start_joints)) - 1.0)
+
+
+def height_limit_text(floor_mm, min_z_mm):
+    """Korean description of the limit height_floor_mm returned, for messages."""
+    if floor_mm < min_z_mm:
+        return "한도 {:g}mm보다 낮은 곳에서 출발 → 출발 높이 {:.0f}mm보다 내려가지 않으면 허용".format(
+            min_z_mm, floor_mm + 1.0)
+    return "한도 {:g}mm".format(min_z_mm)
 
 
 def _prepare(start_joints, target_xyz, limits, rotation, aim, keep_orientation, settings):
@@ -605,7 +625,7 @@ def plan_line(start_joints, target_xyz, limits=None, *, rotation=None, aim=None,
         path = _walk(samples, range(len(samples) - 2, -1, -1), posture, limits, settings)
         line = _longest_fast_enough(list(reversed(path)) + [posture], settings)
         trace = _joint_move_trace(start, line[0], settings.joints_together)
-        if trace[1] < settings.min_z_mm:
+        if trace[1] < height_floor_mm(start, settings.min_z_mm):
             continue
         # Trade lost straight distance against the size of the joint move that
         # reaches the line: 1 degree of the largest joint change counts as 2 mm.
@@ -630,6 +650,6 @@ def plan_joint_move(start_joints, target_xyz, limits=None, *, rotation=None, aim
         start_joints, target_xyz, limits, rotation, aim, keep_orientation, settings)
     for posture in sorted(postures, key=lambda q: float(np.max(np.abs(q - start)))):
         trace = _joint_move_trace(start, posture, settings.joints_together)
-        if trace[1] >= settings.min_z_mm:
+        if trace[1] >= height_floor_mm(start, settings.min_z_mm):
             return _finish(start, target, [posture], trace, settings)
     raise PlanError("관절 이동 경로가 최저 높이 한도 {:g}mm 아래로 내려갑니다.".format(settings.min_z_mm))

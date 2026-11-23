@@ -1,6 +1,8 @@
 """Manual-teaching file validation and mode/replay checks on virtual CAN."""
 
+import contextlib
 import csv
+import io
 import json
 import math
 from pathlib import Path
@@ -377,12 +379,12 @@ class TeachingVirtualTests(VirtualRobotCase):
 
     def test_replay_and_reverse_home_follow_joint_waypoints(self):
         points = [s["q_rad"] for s in (sample(0, 0), sample(0.1, 0.6), sample(0.2, 1.2))]
-        run = execute_path(self.robot, points, output_dir=Path(self.temp.name) / "runs")
+        run = execute_path(self.robot, points, replay_mode="waypoints", output_dir=Path(self.temp.name) / "runs")
         summary = json.loads((run / "summary.json").read_text(encoding="utf-8"))
         self.assertEqual(len(summary["completed_segments"]), 3)
         self.assertIsNone(summary["max_endpoint_error_mm"])
         self.assertLess(summary["max_joint_error_deg"], 0.01)
-        execute_path(self.robot, points, reverse=True, return_path="recorded",
+        execute_path(self.robot, points, reverse=True, return_path="recorded", replay_mode="waypoints",
                      output_dir=Path(self.temp.name) / "runs")
         values = [int.from_bytes(f.data[:4], "big", signed=True)
                   for f in self.device.host_frames if f.arbitration_id == 0x155]
@@ -409,17 +411,28 @@ class TeachingVirtualTests(VirtualRobotCase):
     def test_replay_cycles_and_final_return_use_reverse_route_when_asked(self):
         points = [s["q_rad"] for s in (sample(0, 0), sample(0.1, 0.6))]
         execute_path(self.robot, points, cycles=2, return_to_start=True, return_path="recorded",
-                     output_dir=self.temp.name)
+                     replay_mode="waypoints", output_dir=self.temp.name)
         self.assertEqual(self.j1_targets(), [0, 600, 600, 0, 0, 600, 600, 0])
 
     def test_replay_cycles_and_final_return_go_straight_back_by_default(self):
         points = [s["q_rad"] for s in (sample(0, 0), sample(0.1, 0.6), sample(0.2, 1.2))]
-        run = execute_path(self.robot, points, cycles=2, return_to_start=True, output_dir=self.temp.name)
+        run = execute_path(self.robot, points, cycles=2, return_to_start=True, replay_mode="waypoints",
+                           output_dir=self.temp.name)
         # Each return is one target back to the start, not the waypoints in reverse.
         self.assertEqual(self.j1_targets(), [0, 600, 1200, 0, 0, 600, 1200, 0])
         summary = json.loads((run / "summary.json").read_text(encoding="utf-8"))
         phases = [s["phase"] for s in summary["completed_segments"] if s.get("direct")]
         self.assertEqual(phases, ["cycle_return", "final_return"])
+
+    def test_replay_is_one_continuous_path_by_default(self):
+        points = [s["q_rad"] for s in (sample(0, 0), sample(0.1, 0.6), sample(0.2, 1.2), sample(0.3, 4.0))]
+        run = execute_path(self.robot, points, output_dir=self.temp.name)
+        summary = json.loads((run / "summary.json").read_text(encoding="utf-8"))
+        segment, = summary["completed_segments"]  # One segment for the whole path, not one per point.
+        self.assertTrue(segment["smooth"])
+        self.assertLess(segment["max_joint_error_deg"], 0.11)
+        self.assertEqual(self.j1_targets(), sorted(self.j1_targets()))
+        self.assertEqual(self.j1_targets()[-1], 4000)
 
     def test_direct_home_works_from_a_posture_off_the_recording(self):
         points = [s["q_rad"] for s in (sample(0, 0), sample(0.1, 0.6), sample(0.2, 1.2))]
@@ -434,14 +447,29 @@ class TeachingVirtualTests(VirtualRobotCase):
         self.assertFalse(any(f.arbitration_id == 0x150 for f in self.device.host_frames))
 
     def test_direct_return_that_dips_too_low_sends_nothing(self):
-        points = [s["q_rad"] for s in (sample(0, 0), sample(0.1, 0.6))]
+        # The recording starts with the wrist about 59 mm above the base plane; the arm is upright.
+        low = [math.radians(v) for v in (0, 60, 0, 90, 0, 0, 0)]
+        points = [low, [low[0] + math.radians(0.6)] + low[1:]]
         with self.device._state_lock:
             self.device.current_joints = [math.radians(v) for v in (3, 0, 0, 0, 0, 0, 0)]
             self.device._leader_rad = list(self.device.current_joints)
         time.sleep(0.15)
         with self.assertRaisesRegex(RuntimeError, "recorded"):
-            execute_path(self.robot, points, reverse=True, min_z_mm=5000, output_dir=self.temp.name)
+            execute_path(self.robot, points, reverse=True, min_z_mm=100, output_dir=self.temp.name)
         self.assertFalse(self.j1_targets())
+
+    def test_direct_return_from_below_the_limit_may_rise(self):
+        # Same rule as nero_home.py (2026-11-23): starting low is fine if the arm only goes up.
+        from nero_teach import move_to_start
+        with self.device._state_lock:
+            self.device.current_joints = [math.radians(v) for v in (0, 60, 0, 90, 0, 0, 0)]
+            self.device._leader_rad = list(self.device.current_joints)
+        time.sleep(0.15)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            move_to_start(self.robot, [0.0] * 7, timeout=10, min_z_mm=100)
+        self.assertIn("출발 높이", output.getvalue())
+        actual = list(self.robot.get_joint_angles().msg)
+        self.assertLess(max(abs(v) for v in actual), math.radians(0.11))
 
     def test_recording_state_blocks_disabled_motors_before_leader_mode(self):
         with self.device._state_lock:
@@ -649,7 +677,8 @@ class TeachingVirtualTests(VirtualRobotCase):
         self.device.accept_joints = False
         points = [s["q_rad"] for s in (sample(0, 0), sample(0.1, 1))]
         with self.assertRaises(RuntimeError):
-            execute_path(self.robot, points, timeout=0.15, return_to_start=True, output_dir=self.temp.name)
+            execute_path(self.robot, points, timeout=0.15, return_to_start=True, replay_mode="waypoints",
+                         output_dir=self.temp.name)
         summaries = list(Path(self.temp.name).glob("*/summary.json"))
         self.assertEqual(len(summaries), 1)
         self.assertEqual(json.loads(summaries[0].read_text(encoding="utf-8"))["status"], "failed")

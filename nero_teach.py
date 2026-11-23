@@ -12,8 +12,8 @@ import uuid
 
 from pyAgxArm import AgxArmFactory, ArmModel, create_agx_arm_config
 from nero_enable import DRIVER_ERROR_FIELDS
-from nero_kinematics import joint_move_trace
-from nero_move_joint import check_before_move, motion_feedback, move_joint_target
+from nero_kinematics import height_floor_mm, height_limit_text, joint_move_trace
+from nero_move_joint import check_before_move, follow_joint_path, motion_feedback, move_joint_target
 from nero_move_linear import flange_pose
 from nero_read_status import FeedbackUnavailableError, connect_nero, feedback_time, recent, require_feedback
 from nero_repeat_air import RunRecorder, observe
@@ -732,11 +732,13 @@ def move_to_start(robot, start, *, speed_percent=5, timeout=30.0, min_z_mm=50.0,
     current = motion_feedback(robot)[0]
     travel = math.degrees(joint_error(current, start))
     path_mm, lowest_mm = joint_move_trace(current, start, together=True)
+    floor_mm = height_floor_mm(current, min_z_mm)
+    limit = height_limit_text(floor_mm, min_z_mm)
     print("시작 자세로 바로 이동: 가장 많이 도는 관절 {:.1f}도 / 플랜지 이동 약 {:.0f}mm / "
-          "팔꿈치·손목·플랜지 최저 높이 {:.0f}mm (한도 {:g}mm)".format(travel, path_mm, lowest_mm, min_z_mm))
-    if lowest_mm < min_z_mm:
-        raise RuntimeError("시작 자세로 바로 가면 높이 {:.0f}mm까지 내려갑니다 (한도 {:g}mm). "
-                           "--return-path recorded로 기록을 거꾸로 따라가세요.".format(lowest_mm, min_z_mm))
+          "팔꿈치·손목·플랜지 최저 높이 {:.0f}mm ({})".format(travel, path_mm, lowest_mm, limit))
+    if lowest_mm < floor_mm:
+        raise RuntimeError("시작 자세로 바로 가면 높이 {:.0f}mm까지 내려갑니다 ({}). "
+                           "--return-path recorded로 기록을 거꾸로 따라가세요.".format(lowest_mm, limit))
     if travel > 90:
         print("큰 관절 이동입니다. 팔 전체가 넓게 휘돌아 가므로 주변 공간을 확인하세요.")
     if start_delay > 0:
@@ -749,7 +751,8 @@ def move_to_start(robot, start, *, speed_percent=5, timeout=30.0, min_z_mm=50.0,
 
 def execute_path(robot, points, *, reverse=False, cycles=1, return_to_start=False,
                  timeout=30.0, step_degrees=2.0, output_dir="data/nero_teach/runs", source="",
-                 return_path="direct", speed_percent=5, min_z_mm=50.0, start_delay=0.0):
+                 return_path="direct", speed_percent=5, min_z_mm=50.0, start_delay=0.0,
+                 replay_mode="smooth"):
     """Replay ``points`` (or, with ``reverse``, return to their start).
 
     ``return_path``: "direct" goes back to the first posture with one joint
@@ -759,6 +762,8 @@ def execute_path(robot, points, *, reverse=False, cycles=1, return_to_start=Fals
     """
     if return_path not in ("direct", "recorded"):
         raise ValueError("복귀 방식은 direct 또는 recorded입니다.")
+    if replay_mode not in ("smooth", "waypoints"):
+        raise ValueError("재생 방식은 smooth 또는 waypoints입니다.")
     current = check_before_move(robot)
     route = list(reversed(points)) if reverse else list(points)
     if reverse and joint_error(current, points[0]) <= math.radians(0.1):
@@ -778,7 +783,8 @@ def execute_path(robot, points, *, reverse=False, cycles=1, return_to_start=Fals
                                 coordinate_frame="robot_base", control_point="flange",
                                 units="CSV: mm, deg, s; waypoints: rad",
                                 waypoints_rad=route, speed_percent=speed_percent, return_path=return_path,
-                                notes="Joint waypoint replay; original timing and contact force are not reproduced."),
+                                replay_mode=replay_mode,
+                                notes="Joint path replay; original timing and contact force are not reproduced."),
                            enforce_motion_state=True)
     result, reason = "completed", ""
     try:
@@ -802,6 +808,19 @@ def execute_path(robot, points, *, reverse=False, cycles=1, return_to_start=Fals
                         target_rad=points[0], actual_rad=actual, endpoint_error_mm=None,
                         max_joint_error_deg=math.degrees(joint_error(actual, points[0]))))
                     recorder.event("waypoint_completed", **recorder.segments[-1])
+                    continue
+                if replay_mode == "smooth":
+                    recorder.set_phase(cycle, phase)
+                    recorder.event("path_requested", points=len(leg))
+                    print("{} (연속 재생, 점 {}개) / 실행 {}/{}".format(phase, len(leg), cycle, cycles))
+                    actual, deviation = follow_joint_path(
+                        robot, leg, timeout=timeout, speed_percent=speed_percent,
+                        lead_degrees=max(2.0, 0.3 * speed_percent), on_feedback=recorder.check)
+                    recorder.segments.append(dict(cycle=cycle, phase=phase, index=len(leg) - 1, smooth=True,
+                        target_rad=leg[-1], actual_rad=actual, endpoint_error_mm=None,
+                        max_path_deviation_deg=deviation,
+                        max_joint_error_deg=math.degrees(joint_error(actual, leg[-1]))))
+                    recorder.event("path_completed", **recorder.segments[-1])
                     continue
                 for index, target in enumerate(leg):
                     recorder.set_phase(cycle, phase)
@@ -857,6 +876,9 @@ def get_parser():
                          help="속도 비율(%%), 1~{}. 기본 {}".format(MAX_SPEED_PERCENT, DEFAULT_SPEED_PERCENT))
         sub.add_argument("--min-z-mm", type=float, default=50.0,
                          help="direct 복귀 중 팔꿈치·손목·플랜지 최저 허용 높이(mm). 기본 50. 충돌 검사는 아님")
+        sub.add_argument("--replay-mode", choices=("smooth", "waypoints"), default="smooth",
+                         help="smooth(기본): 경로를 멈추지 않고 연속으로 따라감 / "
+                              "waypoints: 2도 간격 점마다 멈췄다 가는 이전 방식")
     replay = commands.choices["replay"]
     replay.add_argument("--cycles", type=int, default=1, help="재생 횟수, 1~10. 사이에는 시작 자세로 복귀")
     replay.add_argument("--return-to-start", action="store_true", help="마지막 재생 후에도 시작 자세로 복귀")
@@ -944,7 +966,7 @@ def main():
                 time.sleep(3)
                 execute_path(robot, points, reverse=True, timeout=args.timeout,
                              step_degrees=args.step_deg, source=path, return_path=args.return_path,
-                             speed_percent=args.speed, min_z_mm=args.min_z_mm)
+                             speed_percent=args.speed, min_z_mm=args.min_z_mm, replay_mode=args.replay_mode)
         elif args.command == "control":
             # Normal telemetry alone does not prove the role is follower. An
             # explicit control request observes a stop then requests follower.
@@ -959,7 +981,8 @@ def main():
                          return_to_start=getattr(args, "return_to_start", False),
                          timeout=args.timeout, step_degrees=args.step_deg, source=path,
                          return_path=args.return_path, speed_percent=args.speed, min_z_mm=args.min_z_mm,
-                         start_delay=START_DELAY_S if args.command == "home" else 0.0)
+                         start_delay=START_DELAY_S if args.command == "home" else 0.0,
+                         replay_mode=args.replay_mode)
         _diagnose(robot, "completed")
         return 0
     except (Exception, KeyboardInterrupt) as exc:

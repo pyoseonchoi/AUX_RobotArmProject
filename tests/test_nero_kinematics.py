@@ -7,7 +7,7 @@ import numpy as np
 
 from pyAgxArm.utiles.mdh_kinematics import fk_from_mdh, get_mdh
 from nero_kinematics import (TOOL_AXES, PlanError, PlanSettings, arm_angle, arm_angle_gradient,
-                             default_limits, forward, from_rotation_vector, jacobian,
+                             default_limits, forward, from_rotation_vector, height_floor_mm, jacobian,
                              min_singular_value, plan_joint_move, plan_line, pose6, rotation_angle,
                              rotation_vector, rpy_to_matrix, segment_distance_mm, solve_ik, wrist_tilt)
 
@@ -273,6 +273,14 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(len(plan.line_joints), 1)
         self.assertEqual(plan.line_joints[0], plan.entry_joints)
         self.assertLess(np.linalg.norm(forward(plan.entry_joints)[0] - [-0.35, 0.0, 0.30]), 5e-5)
+
+    def test_start_below_the_height_limit_may_move_up(self):
+        # Flange 34 mm above the base plane (2026-11-23). Moving away upward is allowed.
+        low = np.radians([37.616, 57.185, -1.369, 122.024, -8.082, 3.174, -4.643])
+        self.assertLess(height_floor_mm(low, 50), 50)
+        plan = plan_line(low, [-0.30, 0.0, 0.35])
+        self.assertGreaterEqual(plan.min_z_mm, height_floor_mm(low, 50))
+        self.assertEqual(height_floor_mm(UPRIGHT, 50), 50)
 
     def test_unreachable_low_or_conflicting_requests_are_rejected(self):
         with self.assertRaises(PlanError):

@@ -1,6 +1,7 @@
 """Beginner step 3: move one already-enabled joint by 0.5 to 5 degrees."""
 
 import argparse
+import bisect
 import math
 import time
 
@@ -445,6 +446,164 @@ def _execute_joint_target(robot, target, timeout, *, on_feedback=None, arrival_d
                 )
             # While the target is still being led forward, refresh it in fine steps.
             time.sleep(0.05 if line is None or line.fraction >= 1.0 else 1.0 / update_hz)
+    except BaseException as exc:
+        if started:
+            stop_failed_move(robot, exc, watch)
+        raise
+
+
+class JointPath:
+    """Targets a short lead ahead of the arm along a joint-space polyline.
+
+    Distance along the path is measured as the largest single-joint change, so
+    ``lead_degrees`` means "the fastest-moving joint is this far ahead".
+    Progress comes from projecting the measured joints onto the path and never
+    moves backward. Like JointLine, but for a whole recorded path, so a replay
+    is one continuous motion instead of a stop at every waypoint.
+    """
+
+    WINDOW = 8  # Segments searched ahead of the current one when projecting.
+
+    def __init__(self, points, lead_degrees):
+        self.points = [list(p) for p in points]
+        self.lengths = [max(abs(b - a) for a, b in zip(p, q)) for p, q in zip(self.points, self.points[1:])]
+        self.starts = [0.0]
+        for length in self.lengths:
+            self.starts.append(self.starts[-1] + length)
+        self.total = self.starts[-1]
+        self.lead = math.radians(lead_degrees)
+        self.index, self.progress, self.sent = 0, 0.0, None
+
+    @property
+    def finished(self):
+        return self.sent is not None and self.sent >= self.total
+
+    def point_at(self, s):
+        if s >= self.total:
+            return list(self.points[-1])
+        i = max(0, min(len(self.lengths) - 1, bisect.bisect_left(self.starts, s) - 1))
+        length = self.lengths[i]
+        u = 0.0 if length <= 0 else (s - self.starts[i]) / length
+        return [a + (b - a) * u for a, b in zip(self.points[i], self.points[i + 1])]
+
+    def locate(self, angles):
+        """Advance progress to the measured joints; return their distance (rad) from the path."""
+        best = None
+        for i in range(self.index, min(len(self.lengths), self.index + self.WINDOW)):
+            a, b = self.points[i], self.points[i + 1]
+            span = [y - x for x, y in zip(a, b)]
+            length2 = sum(d * d for d in span)
+            u = 0.0 if length2 <= 0 else min(1.0, max(0.0, sum((q - x) * d for q, x, d in zip(angles, a, span)) / length2))
+            near = [x + d * u for x, d in zip(a, span)]
+            distance = max(abs(q - n) for q, n in zip(angles, near))
+            if best is None or distance < best[0] - 1e-9:
+                best = (distance, i, self.starts[i] + u * self.lengths[i])
+        distance, index, s = best
+        if s > self.progress:
+            self.index, self.progress = index, s
+        return distance
+
+    def advance(self, angles):
+        """(next target or None, distance of the arm from the path in rad)."""
+        distance = self.locate(angles)
+        wanted = min(self.total, self.progress + self.lead)
+        if self.sent is not None and wanted <= self.sent + 1e-6:
+            return None, distance
+        self.sent = wanted
+        return self.point_at(wanted), distance
+
+
+def follow_joint_path(robot, points, *, timeout=30.0, speed_percent=5, lead_degrees=2.0, update_hz=100.0,
+                      max_deviation_degrees=5.0, arrival_degrees=0.1, on_feedback=None):
+    """Drive the joints continuously along ``points`` (rad) and stop at the last one.
+
+    The arm must start within 0.5 degree of the first point. Targets stay
+    ``lead_degrees`` ahead along the path and are refreshed at ``update_hz``.
+    Fails, with the usual stop policy, if the arm strays more than
+    ``max_deviation_degrees`` from the path or stops making progress for
+    ``timeout`` seconds. Returns (final angles, largest distance from the path in deg).
+    """
+    points = [list(p) for p in points]
+    check_speed_percent(speed_percent)
+    if len(points) < 2 or any(len(p) != 7 or not all(math.isfinite(a) for a in p) for p in points):
+        raise ValueError("경로는 유한한 rad 관절각 7개짜리 점 2개 이상이어야 합니다.")
+    if not math.isfinite(lead_degrees) or not 0.5 <= lead_degrees <= 10:
+        raise ValueError("관절 선행 각도는 0.5~10도입니다.")
+    if not math.isfinite(update_hz) or not 10 <= update_hz <= 200:
+        raise ValueError("관절 목표 갱신 빈도는 10~200Hz입니다.")
+    limits = robot.get_config()["joint_limits"]
+    for point in points:
+        for i, angle in enumerate(point, 1):
+            low, high = limits[f"joint{i}"]
+            if not low <= angle <= high:
+                raise RuntimeError(f"경로의 J{i} 각도가 SDK 범위 밖입니다. 이동하지 않습니다.")
+    start = check_before_move(robot)
+    if max(abs(a - b) for a, b in zip(start, points[0])) > math.radians(0.5):
+        raise RuntimeError("현재 자세가 경로의 시작점에서 0.5도 넘게 벗어났습니다. 이동하지 않습니다.")
+    require_planned_mode(robot)
+    path = JointPath(points, lead_degrees)
+    final = points[-1]
+    started = False
+    watch = None
+    worst = 0.0
+    try:
+        if on_feedback is not None:
+            on_feedback()
+        watch = RejectionWatch(robot, start)
+        robot.set_speed_percent(speed_percent)
+        started = True
+        last_sent, _ = path.advance(start)
+        robot.move_j(last_sent)
+        watch.target_sent()
+        resend = ResendGuard([math.radians(0.05)])
+        diagnose(robot, "joint_path_started", points=len(points), length_deg=math.degrees(path.total),
+                 lead_degrees=lead_degrees, update_hz=update_hz)
+        print("경로를 연속으로 따라갑니다: 점 {}개, 가장 많이 도는 관절 기준 경로 길이 {:.1f}도.".format(
+            len(points), math.degrees(path.total)))
+        waiting = ProgressTimeout(timeout, [math.radians(0.1), math.radians(0.05)])
+        reached_samples = 0
+        previous_stamps = None
+        while True:
+            if on_feedback is not None:
+                on_feedback()
+            angles, motion_status = motion_feedback(robot)
+            watch.check(angles)
+            ahead, distance = path.advance(angles)
+            worst = max(worst, distance)
+            if distance > math.radians(max_deviation_degrees):
+                raise RuntimeError("관절이 기록 경로에서 {:.1f}도 벗어났습니다 (한도 {:g}도).".format(
+                    math.degrees(distance), max_deviation_degrees))
+            if ahead is not None:
+                last_sent = ahead
+                robot.move_j(ahead)
+                resend.sent()
+            error = max(abs(a - b) for a, b in zip(angles, final))
+            if (path.finished and error >= math.radians(arrival_degrees)
+                    and resend.due(motion_status == 0, [error])):
+                robot.move_j(last_sent)
+                resend.sent()
+                diagnose(robot, "joint_target_resent", target_rad=last_sent, error_deg=math.degrees(error),
+                         resend=resend.resends)
+                print("끝점 도달 보고 후에도 {:.2f}도 떨어져 있어 끝점을 다시 보냅니다 ({}회).".format(
+                    math.degrees(error), resend.resends))
+            parser = getattr(robot, "_parser", None)
+            joint = robot.get_joint_angles()
+            stamps = (joint.timestamp,) if parser is None else tuple(
+                getattr(parser, name).timestamp for name in ("joint_12", "joint_34", "joint_56", "joint_7"))
+            reached = path.finished and motion_status == 0 and error < math.radians(arrival_degrees)
+            if not reached:
+                reached_samples = 0
+            if previous_stamps is None or all(a > b for a, b in zip(stamps, previous_stamps)):
+                reached_samples = reached_samples + 1 if reached else 0
+                previous_stamps = stamps
+            if reached_samples >= 3:
+                diagnose(robot, "joint_path_completed", max_deviation_deg=math.degrees(worst))
+                print("경로 끝점 도착 확인. 경로에서 가장 멀리 벗어난 정도 {:.2f}도.".format(math.degrees(worst)))
+                return angles, math.degrees(worst)
+            if waiting.expired([path.total - path.progress, error]):
+                raise RuntimeError("경로 진행 확인 시간 초과({:g}초 동안 진행 없음): 남은 경로 {:.2f}도, 끝점 오차 {:.3f}도".format(
+                    timeout, math.degrees(path.total - path.progress), math.degrees(error)))
+            time.sleep(0.05 if path.finished else 1.0 / update_hz)
     except BaseException as exc:
         if started:
             stop_failed_move(robot, exc, watch)

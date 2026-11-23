@@ -9,7 +9,7 @@ import tempfile
 import time
 from unittest.mock import patch
 
-from nero_home import capture_home, load_home, main, return_home
+from nero_home import capture_home, check_return_path, load_home, main, return_home
 from nero_read_status import print_status
 from tests.test_nero_move_to import VirtualRobotCase
 from tests.test_nero_stop_policy import PolicySlave, JOINT_IDS
@@ -90,10 +90,26 @@ class HomeTests(VirtualRobotCase):
         self.assertAlmostEqual(self.robot.get_joint_angles().msg[0], home["joints_rad"][0], places=4)
 
     def test_return_that_dips_too_low_sends_nothing(self):
+        # Home has the wrist about 59 mm above the base plane; the arm starts upright.
         home = self.home()
-        home["joints_rad"][0] += math.radians(3)
-        with self.assertRaisesRegex(RuntimeError, "최저|내려갑니다"):
-            return_home(self.robot, home, min_z_mm=5000)
+        home["joints_rad"][1] += math.radians(60)
+        home["joints_rad"][3] += math.radians(90)
+        with self.assertRaisesRegex(RuntimeError, "내려갑니다.*한도 100mm"):
+            return_home(self.robot, home, min_z_mm=100)
+        self.assertFalse(self.device.host_frames)
+
+    def test_low_start_may_return_if_it_never_goes_lower(self):
+        # 2026-11-23: the flange was 34 mm up and the return only rose, yet it was refused
+        # because the start itself counted as going below the 50 mm limit.
+        low = [math.radians(v) for v in (37.616, 57.185, -1.369, 122.024, -8.082, 3.174, -4.643)]
+        home = {"joints_rad": [0.0, 0.0, 0.0, math.radians(90), 0.0, 0.0, 0.0]}
+        path_mm, lowest_mm = check_return_path(low, home, 50)
+        self.assertLess(lowest_mm, 50)
+        # Going below where it started is still refused.
+        lower = list(low)
+        lower[1] += math.radians(4)
+        with self.assertRaisesRegex(RuntimeError, "출발 높이"):
+            check_return_path(low, {"joints_rad": lower}, 50)
         self.assertFalse(self.device.host_frames)
 
     def test_flange_mismatch_is_not_success(self):

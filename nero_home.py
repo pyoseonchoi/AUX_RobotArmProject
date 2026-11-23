@@ -8,7 +8,7 @@ from pathlib import Path
 import time
 
 from nero_diagnostics import SessionDiagnostics
-from nero_kinematics import joint_move_trace
+from nero_kinematics import height_floor_mm, height_limit_text, joint_move_trace
 from nero_move_joint import move_joint_target
 from nero_move_linear import orientation_error
 from nero_read_status import (FeedbackUnavailableError, connect_nero, feedback_time,
@@ -105,12 +105,16 @@ def check_return_path(angles, home, min_z_mm):
     """Flange path length (mm) and lowest elbow/wrist/flange height (mm) of the return.
 
     Replaces a fixed joint-travel cap: a large swing is allowed as long as the
-    arm does not dip toward the table on the way. No collision check otherwise.
+    arm does not dip toward the table on the way. An arm that already starts
+    below min_z_mm may return as long as it never goes lower than it is now.
+    No collision check otherwise.
     """
     path_mm, lowest_mm = joint_move_trace(angles, home["joints_rad"], together=True)
-    if lowest_mm < min_z_mm:
-        raise RuntimeError("복귀 중 팔꿈치·손목·플랜지가 높이 {:.0f}mm까지 내려갑니다 (한도 {:g}mm). "
-                           "팔을 먼저 위쪽으로 옮긴 뒤 복귀하세요.".format(lowest_mm, min_z_mm))
+    floor_mm = height_floor_mm(angles, min_z_mm)
+    if lowest_mm < floor_mm:
+        raise RuntimeError("복귀 중 팔꿈치·손목·플랜지가 높이 {:.0f}mm까지 내려갑니다 ({}). "
+                           "팔을 먼저 위쪽으로 옮긴 뒤 복귀하세요.".format(
+                               lowest_mm, height_limit_text(floor_mm, min_z_mm)))
     return path_mm, lowest_mm
 
 
@@ -184,8 +188,8 @@ def main():
             print("복귀 경로: 관절 동시 이동, 속도 {}%. 플랜지의 경로는 직선이 아니며 장애물 회피는 하지 않습니다.".format(
                 args.speed))
             path_mm, lowest_mm = joint_move_trace(angles, home["joints_rad"], together=True)
-            print("복귀 중 플랜지 이동 거리 약 {:.0f}mm / 팔꿈치·손목·플랜지 최저 높이 {:.0f}mm (한도 {:g}mm)".format(
-                path_mm, lowest_mm, args.min_z_mm))
+            print("복귀 중 플랜지 이동 거리 약 {:.0f}mm / 팔꿈치·손목·플랜지 최저 높이 {:.0f}mm ({})".format(
+                path_mm, lowest_mm, height_limit_text(height_floor_mm(angles, args.min_z_mm), args.min_z_mm)))
             if math.degrees(travel) > 90:
                 print("큰 관절 이동입니다. 팔 전체가 넓게 휘돌아 가므로 주변 공간을 확인하세요.")
             if args.execute:
